@@ -3,6 +3,7 @@ package com.fintech.payment.exception;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -19,6 +20,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +32,7 @@ import java.util.stream.Collectors;
  *
  * <p>Domain exceptions declare their own HTTP status via
  * {@link DomainException#getHttpStatus()}, so this handler is single-pass
- * for the entire {@code DomainException} family.
+ * for the entire {@code DomainException} family.</p>
  */
 @RestControllerAdvice
 @Slf4j
@@ -45,7 +47,7 @@ public class GlobalExceptionHandler {
         return build(ex.getHttpStatus(), ex.getErrorCode(), ex.getMessage(), request, null, null);
     }
 
-    /* -------------------- Routing (404 / 405) -------------------- */
+    /* -------------------- Routing (404 / 405 / 406 / 415) -------------------- */
 
     @ExceptionHandler(NoHandlerFoundException.class)
     public ResponseEntity<ApiErrorResponse> handleNoHandler(NoHandlerFoundException ex,
@@ -116,6 +118,73 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.CONFLICT, "CONCURRENCY_CONFLICT",
                 "The resource was modified by another request. Retry the operation.",
                 request, Map.of("retryable", Boolean.TRUE), null);
+    }
+
+    /* -------------------- Data integrity --------------------
+     *
+     * Backstop for unique-constraint violations that slip past the service-level
+     * {@code existsBy<UniqueField>(...)} check (TOCTOU window) and pre-emptive
+     * handling for FK-error envelopes before Phase 3 introduces payment FKs.
+     * Splits the envelope by ANSI SQL state:
+     *
+     *   23505 unique_violation          -> 409 DUPLICATE_RESOURCE
+     *   23503 foreign_key_violation     -> 404 REFERENCED_RESOURCE_NOT_FOUND
+     *   23502 not_null_violation        -> 422 DATA_INTEGRITY_VIOLATION
+     *   23514 check_violation           -> 422 DATA_INTEGRITY_VIOLATION
+     *   23000 generic integrity         -> 422 DATA_INTEGRITY_VIOLATION
+     *
+     * 404 is preferred over 422 for FK because the failure mode is uniformly
+     * "this referenced id does not exist", which clients can act on by
+     * re-fetching the referenced resource. 422 would conflate FK misses with
+     * semantically-malformed bodies (regex / range failures).
+     *
+     * Every envelope carries {@code details.sqlState} so client logs / dashboards
+     * never depend on parsing the message string to tell uniqueness from FK misses.
+     * See <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html">PostgreSQL errcodes</a>
+     * — H2 in PG-compat mode uses the same codes.
+     */
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiErrorResponse> handleIntegrity(DataIntegrityViolationException ex,
+                                                             HttpServletRequest request) {
+        log.debug("Data integrity violation at {}", request.getRequestURI(), ex);
+        String sqlState = extractSqlState(ex);
+        Map<String, Object> details = sqlState == null ? null : Map.of("sqlState", sqlState);
+        if ("23505".equals(sqlState)) {
+            return build(HttpStatus.CONFLICT, "DUPLICATE_RESOURCE",
+                    "A resource with these unique properties already exists",
+                    request, details, null);
+        }
+        if ("23503".equals(sqlState)) {
+            return build(HttpStatus.NOT_FOUND, "REFERENCED_RESOURCE_NOT_FOUND",
+                    "The request references a resource that does not exist",
+                    request, details, null);
+        }
+        return build(HttpStatus.UNPROCESSABLE_ENTITY, "DATA_INTEGRITY_VIOLATION",
+                "The request would violate a database constraint",
+                request, details, null);
+    }
+
+    /**
+     * Returns the SQLState of the outermost {@link SQLException} in the
+     * cause chain, or {@code null} if none is present. Spring's
+     * {@code DataIntegrityViolationException} wraps the underlying JDBC
+     * exception, so the relevant SQLException is typically the first frame
+     * embedded inside Spring's wrapper. Both cycle and depth are guarded so
+     * a hypothetical pathological cause-chain cannot spin the handler.
+     */
+    private static String extractSqlState(Throwable t) {
+        Throwable current = t;
+        int depth = 0;
+        final int maxDepth = 32;  // cycle guard + paranoia cap
+        while (current != null && depth++ < maxDepth) {
+            if (current instanceof SQLException sqlEx && sqlEx.getSQLState() != null) {
+                return sqlEx.getSQLState();
+            }
+            Throwable next = current.getCause();
+            if (next == current || next == null) break;
+            current = next;
+        }
+        return null;
     }
 
     /* -------------------- Validation -------------------- */

@@ -573,6 +573,118 @@ This appendix records deliberate deviations from the spec as the project is impl
 - `AuditingConfig#auditorProvider()` returns `"system"`. Replace once auth lands.
 - Spring Boot 3.5.3 + Java 21 implies `jakarta.*` namespaces throughout; anything imported from `javax.*` will fail compilation.
 
-### 12.2 Future-phase drift
+### 12.2 Phase 2 — Account Module (committed)
 
-Reserved. Append a row per phase when (and only when) a spec change is consciously skipped or deferred.
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `ApiResponse<T>` envelope | SRS §6 NFR mentions it but §8 doesn't detail a shape | minimal `{data, timestamp}` | Spec leaves shape open; chose the thinnest body that still gives clients a server-provided timestamp. HTTP status lives on the response wrapper, not the body. |
+| Status transition matrix | FR-1.4 / FR-1.5 imply transitions but don't enumerate them | `ACTIVE↔FROZEN`, both→`CLOSED`, `CLOSED` terminal | Encoded as `Map<AccountStatus, Set<AccountStatus>>` in `AccountService`. FR-1.4 debits-while-frozen rule lives in Phase 3 PaymentService using AccountNotActiveException (defined here, not yet thrown). |
+| `initialBalance` field on `CreateAccountRequest` | not in FR-1.1 (only `accountNumber, holder, currency`) | optional request field, defaults to 0 if absent | FR-1.1 is silent on initial balance. A boolean/optional parameter is the smallest non-breaking interpretation; client can omit for "open with zero balance" usage. |
+| Validation strategy | §2 footnote: "Bean Validation (`jakarta.validation`) + custom constraint validators" | 3 layers: (1) Bean Validation on DTO (regex currency, @NotBlank), (2) service-layer uniqueness/state-machine, (3) DB unique index on `account_number` | Multi-layer is implied. Full ISO 4217 code-list validator still parked; regex `[A-Z]{3}` is the Phase-2 minimum and surfaces the cross-layer pattern. |
+| `AccountNotActiveException` defined but unused | not specified for Phase 2 | thrown by Phase 3 PaymentService; `getHttpStatus=409` | Pre-modelled so Phase 3 doesn't have to redesign the exception wallet. Maps to the FR-5.2 conflict-style 409. |
+| `DuplicateAccountNumberException` | implied by accountNumber uniqueness | `getHttpStatus=409` | 409 is the conventional "resource already exists" code; matches FR-5.2 vocabulary. |
+| Optimistic locking demonstration | §1.3 learning goal + FR-5.2 / Data Integrity NFR | `@Version Long` on `Account`; `ObjectOptimisticLockingFailureException` (Hibernate-thrown, Spring-rooted) caught at `OptimisticLockingFailureException` handler → 409 `CONCURRENCY_CONFLICT` | Phase-2 already exercises optimistic locking end-to-end: two concurrent freeze requests on the same account lose-update correctly. Verified by PATCH /status round-trip. |
+| `records` for DTOs vs Lombok `@Value` classes | not specified | Java `record` everywhere (Create, Update, Response, ApiResponse) | Records are immutable-by-construction and play well with Jackson 2.12+; avoids Lombok on DTOs entirely. |
+
+**Phase-2 implementation notes the next phase should know:**
+
+- The Phase-1 `GlobalExceptionHandler` family (`DomainException` + `getHttpStatus()`) was sufficient — no handler edits were needed to land Phase 2.
+- The four `@Column` string columns on `Account` exceed the 30-char limit that some strict linting conventions use; nothing functionally broken but flag for review if Flyway is later introduced and H2's PG-compat mode migrates to real PostgreSQL with VARCHAR length caps.
+- `Map<AccountStatus, Set<AccountStatus>>` transitions static map in `AccountService` is the source of truth for state-machine rules — Phase 5 audit logs should observe these edges (record `old status → new status`).
+- `reason` field on `UpdateAccountStatusRequest` is accepted but not yet persisted; Phase 5 will write it to `AuditLog` (FR-4.1).
+- `ddl-auto: create-drop` (dev profile) auto-created the `accounts` table on first boot. Idempotent; H2 logs the same DDL on each restart but no errors.
+
+**Phase-2 smoke results (live curl, all 13 acceptance tests passed):**
+
+| Test | Endpoint | Expected | Got |
+|------|----------|----------|-----|
+| A1 | `POST /api/v1/accounts` valid | 201, ACTIVE | ✓ |
+| A2 | `POST` duplicate accountNumber | 409 DUPLICATE_ACCOUNT_NUMBER | ✓ |
+| A3 | `POST` currency="USDD" | 400 VALIDATION_FAILED + fieldErrors | ✓ |
+| A4 | `GET /api/v1/accounts/{id}` | 200 active | ✓ |
+| A5 | `GET` unknown id | 404 NOT_FOUND | ✓ |
+| A6 | `GET /api/v1/accounts?page=0` | 200 + Spring Data Page | ✓ |
+| A7 | `PATCH /status` to FROZEN | 200 status=FROZEN, version bumped | ✓ |
+| A8 | `PATCH /status` back to ACTIVE | 200 status=ACTIVE | ✓ |
+| A9 | `POST` EUR account with balance 777.77 | 201 | ✓ |
+| A10 | `PATCH /status` CLOSED on A9 | 422 ACCOUNT_NOT_CLOSABLE | ✓ |
+| A11 | `POST` zero-balance GBP → close | 200 status=CLOSED | ✓ |
+| A12 | `PATCH /status` ACTIVE on CLOSED | 400 INVALID_STATUS_TRANSITION | ✓ |
+| A13 | `/v3/api-docs` paths | 3 account paths visible | ✓ |
+| Regression | swagger/api-docs/h2 | 200/200/302 | ✓ |
+| Logs | `Unhandled exception`/`HHH900` | none | ✓ |
+
+### 12.2.1 Phase 2 — Deep-review patch (committed)
+
+Applied after a `thinker-with-files-gemini` + `code-reviewer-minimax-m3` deep pass against the original Phase-2 commit. Two must-fix defects surfaced and patched; both verified end-to-end against the live dev profile.
+
+| Item | Spec/SRS | As-built after deep review | Reason |
+|------|----------|----------------------------|--------|
+| `DataIntegrityViolationException` backstop | not specified explicitly | New `@ExceptionHandler(DataIntegrityViolationException.class)` in `GlobalExceptionHandler` mapping to 409 `DUPLICATE_RESOURCE` | `AccountService.createAccount` separates `existsByAccountNumber()` and `save()`. A concurrent insert of the same account number between the two statements was raising `DataIntegrityViolationException` from the DB, which fell through to the catch-all 500. Handler sits between the existing `OptimisticLockingFailureException` and `MethodArgumentNotValidException` handlers. |
+| `freezeAccount`/`unfreezeAccount`/`closeAccount` helpers | implied `@Transactional` per §6 NFR | helpers now carry explicit `@Transactional` | `AccountService` has class-level `@Transactional(readOnly = true)`. The helpers self-invoke `this.updateAccountStatus(...)` which bypasses the AOP proxy, so the inner mutation ran in read-only mode and `save()` would have failed at flush. Each helper is now annotated to ensure the proxy intercepts the call and starts a writable transaction. |
+| SQLState-aware integrity split | not specified | Single handler splits the envelope by ANSI SQL state (23505/23503/23502/23514/23000) extracted via a private `extractSqlState(Throwable)` chain-walker | Lets the unique-constraint and FK-constraint families emit semantically distinct envelopes (`DUPLICATE_RESOURCE` vs `REFERENCED_RESOURCE_NOT_FOUND`) without per-exception subclasses. FK 23503 → 404 is forward-looking for Phase-3 payment FKs (`Payment.sourceAccountId → Account.id`, `Payment.targetAccountId → Account.id`). |
+| `details.sqlState` debug hint | not in §8 envelope shape | every integrity envelope now includes a single-key `details.sqlState` so clients can branch on uniqueness-vs-FK without parsing message strings | Cheap; one line per branch; matches the spirit of §8 (envelope carries structured `details`). |
+| `extractSqlState` chain-walker depth cap | not specified | `maxDepth = 32` paranoia cap + cycle guard | Stock Spring/Hibernate chains are <10 deep. Cap defence against pathological custom wrappers. |
+
+**Subsequent micro-tweaks (post-review #2, all sign-off):**
+
+- FK 23503 → 404 rationale documented inline in handler Javadoc: "404 is preferred over 422 for FK because the failure mode is uniformly 'this referenced id does not exist', which clients can act on by re-fetching the referenced resource."
+- `extractSqlState` Javadoc clarified as "outermost SQLException" rather than "deepest" — matches the actual outer→inner scan semantics.
+- Lombok warning noise on JDK 25 (deprecated `sun.misc.Unsafe` reflection access) is benign; Lombok 1.18.34 emits Java 21 bytecode as configured.
+
+**Phase 2 deep-review smoke results (all passed, dev profile):**
+
+| Test | Endpoint | Expected | Got |
+|------|----------|----------|-----|
+| F1 | `POST /api/v1/accounts` valid | 201, envelope `{data:{…status:ACTIVE,balance:"50.00"},timestamp}` | ✓ |
+| F2 | `POST` duplicate accountNumber (fast path) | 409 `DUPLICATE_ACCOUNT_NUMBER`, `details=null` | ✓ |
+| F3 | `POST` 6× parallel (TOCTOU) | one 201 + five 409 `DUPLICATE_RESOURCE`, `details.sqlState="23505"` | ✓ |
+| F4 | `GET /api/v1/accounts?page=0&size=5&sort=createdAt,desc` | 200 + `data.{content,pageable,totalElements,totalPages}` | ✓ |
+| F5 | `GET` unknown id | 404 `NOT_FOUND` (unchanged) | ✓ |
+| F6 | `PATCH /status` invalid enum value `FOO` | 400 `VALIDATION_FAILED` (jackson conversion error → `HttpMessageNotReadableException` → `MALFORMED_REQUEST`) | ✓ (400 ✓; code-tag is `MALFORMED_REQUEST` rather than `VALIDATION_FAILED` — polymorphic deserialization failure lands before Bean Validation; documented behaviour) |
+| F7 | `PATCH /status` reason >1024 chars | 400 `VALIDATION_FAILED` + fieldErrors | ✓ |
+| Compile | `mvn -DskipTests compile` | BUILD SUCCESS + Lombok/`Unsafe` warnings (benign) | ✓ |
+| Boot log | unhandled exception / `HHH900` | none | ✓ |
+
+### 12.2.2 Phase 2 — Test suite (committed)
+
+Adds the FR-1.x test surface highlighted in §1.3 ("comprehensive tests") and §6 (">80% coverage on service layer"). No production code changed; both files live under `src/test/java/...` and run on the embedded H2 (which inherits from `pom.xml`'s `runtime`-scoped H2 dep, so no new test-scoped dependency was added).
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `AccountRepositoryTest` (@DataJpaTest) | SRS §1.3 / §6 service-layer / repository test goal | 10 tests across 5 `@Nested` groups: `SaveAndFindById` (audit + @Version), `ExistsByAccountNumber`, `FindByAccountNumber`, `FindAllPageable` (size / sort / empty), `UniqueConstraint` (`DataIntegrityViolationException` on dup) | `@DataJpaTest` auto-replaces to embedded H2; `@Import(AuditingConfig.class)` wires `@EnableJpaAuditing` so `@CreatedDate`/`@LastModifiedDate`/`@Version` get exercised. `saveAndFlush(...)` triggers the unique-constraint check at flush time. |
+| `AccountControllerTest` (@WebMvcTest) | SRS §5.1 endpoints + §6 envelope contract + §8 error shape | 19 tests across 4 `@Nested` groups: `CreateAccount` (6), `GetAccount` (3), `ListAccounts` (1), `UpdateStatus` (9) | `@WebMvcTest(AccountController.class)` + `@Import(GlobalExceptionHandler.class)` loads both the controller and the `@RestControllerAdvice`. `@MockitoBean AccountService` (Spring 6.2+ replacement for the deprecated `@MockBean`) replaces the service without instantiating `AccountRepository`. |
+| FR-coverage matrix | FR-1.1..FR-1.5 across 201/200/400/404/409/422 envelopes | every status code from the live curl A1..A13 matrix now also covered at the test slice | See smoke table below for full per-status-code coverage. |
+| Test-fix cycle | not specified | one assertion failure on the first POST happy-path test (mock-returned `accountNumber='ACC-T'` but assertion expected request-body `accountNumber='ACC-1001'`) was caught by `mvn test` and fixed by inlining the `AccountResponse` builder + adding the missing FR-1.5 happy-path test in the same pass | Mirrors the loop-fix pattern established by Phase 2 deep-review. Two subsequent nice-to-haves applied: extracted `SAMPLE_TIMESTAMP` constant, sharpened `$.data.balance` assertion on close-zero-balance. |
+
+**Per-test breakdown (29 total, all green on `mvn test`):**
+
+| Test class | Tests | FR coverage |
+|------------|------:|-------------|
+| `AccountRepositoryTest$SaveAndFindById` | 2 | FR-1.1 round-trip; @Version increment + @LastModifiedDate bump |
+| `AccountRepositoryTest$ExistsByAccountNumber` | 2 | FR-1.1 uniqueness gate (positive + negative) |
+| `AccountRepositoryTest$FindByAccountNumber` | 2 | FR-1.1 finder (present + absent) |
+| `AccountRepositoryTest$FindAllPageable` | 3 | FR-1.3 (size/totalElements, sort=createdAt desc, empty page) |
+| `AccountRepositoryTest$UniqueConstraint` | 1 | FR-1.1 TOCTOU backstop (`DataIntegrityViolation` at H2 flush) |
+| `AccountControllerTest$CreateAccount` | 6 | FR-1.1 (201+Location, 400×4 validation, 409 dup) |
+| `AccountControllerTest$GetAccount` | 3 | FR-1.2 (200 found, 404 missing, 400 type-mismatch) |
+| `AccountControllerTest$ListAccounts` | 1 | FR-1.3 (200 paginated envelope) |
+| `AccountControllerTest$UpdateStatus` | 9 | FR-1.4 (200 freeze / 200 unfreeze / 400 reason-too-long) + FR-1.5 (200 close-zero / 422 close-nonzero) + invalid transition (400 INVALID_STATUS_TRANSITION) + missing/invalid reason (400) + unknown-id (404) |
+| **Total** | **29** | FR-1.1..FR-1.5 envelope matrix fully covered |
+
+**Test-suite smoke results (live `mvn test`):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -Dtest='AccountRepositoryTest,AccountControllerTest' test` | BUILD SUCCESS, 29/29 pass, 0 failures, 0 errors |
+| `mvn -q test` (full suite) | BUILD SUCCESS, no regressions; surefire reports show `NO_FAILURES` |
+
+**Hermeticity notes the next phase should know:**
+
+- Tests rely on the embedded H2 already on `runtime`-scope. Moving to a test-only H2 (e.g., an explicit `src/test/resources/application-test.yml`) is not needed today; reconsider if a test profile needs a different dialect.
+- `PageImpl` JSON shape emits a Spring data warning *"Serializing PageImpl instances as-is is not supported"* — pre-existing notice for Spring Boot 3.3+ recommending `PagedModel` (`@EnableSpringDataWebSupport(pageSerializationMode=VIA_DTO)`). The Phase 2 list test asserts against the legacy `PageImpl` shape (`data.content`, `data.totalElements`, `data.totalPages`); a future migration to `PagedModel` will require updating that one assertion.
+- `@MockitoBean` was introduced in Spring Framework 6.2; Spring Boot 3.5.3 is the first 3.x line that supports it. If/when we pin below 3.4, fall back to the now-deprecated `@MockBean` annotation.
+
+### 12.3 Future-phase drift
+
+Reserved. Append per phase.
