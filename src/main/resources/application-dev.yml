@@ -1,0 +1,17 @@
+# Dev profile — H2 in-memory DB, schema auto-created for fast iteration.
+spring:
+  datasource:
+    url: jdbc:h2:mem:paymentdb;DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  jpa:
+    # database-platform omitted: Hibernate 6 auto-detects H2 from the JDBC URL
+    # (and warns HH90000025 if you set it explicitly).
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+  h2:
+    console:
+      enabled: true
+      path: /h2-console

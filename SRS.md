@@ -1,7 +1,7 @@
 # Software Requirements Specification — Payment Settlement API
 
 > **Project:** Payment Settlement & Transaction Processing API
-> **Stack:** Java 25, Spring Boot 4.x, Spring Data JPA, H2/PostgreSQL, Maven
+> **Stack:** Java 21 (compiled from a JDK 25 toolchain), Spring Boot 3.5.3 → 4.x, Spring Data JPA, H2/PostgreSQL, Maven
 > **Version:** 1.0
 
 ---
@@ -550,3 +550,29 @@ com.fintech.payment
 ---
 
 *This document will evolve as we build. Each phase's implementation should reference the relevant FR IDs.*
+
+---
+
+## 12. Drift Log
+
+This appendix records deliberate deviations from the spec as the project is implemented. **Append-only**, dated by phase. Inline comments in the spec are not edited; the log is the single source of truth for "what we actually shipped."
+
+### 12.1 Phase 1 — Project Scaffolding (committed)
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| Java | 25 | 21 (target) / JDK 25 (host) | Only OpenJDK 25 is installed on the build host. The maven-compiler-plugin emits Java 21 bytecode (`<java.version>21</java.version>`) so the artifact is portable. Migration to a 25-target toolchain is deferred until Spring Boot 4.0 lands. |
+| Spring Boot | 4.x | 3.5.3 (latest GA) | Spring Boot 4.0 has not been released on Maven Central. 3.5.3 is the closest match in dependency coverage (`spring-boot-starter-{web,data-jpa,validation}`, Spring Retry 2.0.12, SpringDoc 2.8.6, H2, PostgreSQL, Lombok). Re-pin when 4.x GA ships. |
+| `OptimisticLockingFailureException` handler | not in §7, but implied by FR-5.2 | `GlobalExceptionHandler` returns 409; added `ConcurrencyConflictException` | FR-5.2 ("concurrency conflict → HTTP 409 with retry guidance") would otherwise require redesigning the global handler in Phase 3. Added now, before any `@Version`-bearing entity exists. |
+| `spring-retry-test` dependency | implied by §6 (>80% test coverage) | removed | Artifact `org.springframework.retry:spring-retry-test` is **not published** on Maven Central as of Spring Retry 2.0.x. The artifact cannot be resolved by Maven. Phase 6 retry tests will use plain Mockito stubs; the dep is re-added once Spring Retry publishes it. |
+| `DomainException#getHttpStatus()` (default 400) | not in §8 | added | Lets `GlobalExceptionHandler` stay single-pass: every subclass declares its target HTTP status. Concrete examples shipped today: `ResourceNotFoundException → NOT_FOUND (404)`, `ConcurrencyConflictException → CONFLICT (409)`. Future `InsufficientFundsException → UNPROCESSABLE_ENTITY (422)` for FR-5.3 will reuse the same mechanism with zero handler changes. |
+
+**Implementation notes the next phase should know:**
+
+- `application.yml` sets `spring.profiles.default: dev` (H2 in-memory, `ddl-auto: create-drop`). `application-prod.yml` reads DB credentials from env vars and is `ddl-auto: validate`; **Flyway is not yet wired** (see SRS §10.2 — out of scaffold scope).
+- `AuditingConfig#auditorProvider()` returns `"system"`. Replace once auth lands.
+- Spring Boot 3.5.3 + Java 21 implies `jakarta.*` namespaces throughout; anything imported from `javax.*` will fail compilation.
+
+### 12.2 Future-phase drift
+
+Reserved. Append a row per phase when (and only when) a spec change is consciously skipped or deferred.

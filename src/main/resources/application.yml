@@ -1,0 +1,36 @@
+# =============================================================================
+#  Payment Settlement API — base configuration
+#  Profile-specific overrides live in application-{profile}.yml
+# =============================================================================
+
+spring:
+  application:
+    name: payment-settlement-api
+  profiles:
+    default: dev
+  # Open-In-View must remain disabled to avoid lazy loading inside controllers.
+  jpa:
+    open-in-view: false
+  # Throw NoHandlerFoundException on unmapped paths so GlobalExceptionHandler can
+  # shape 404/405 responses per SRS §8. Without this, Spring Boot's default
+  # /error mapping swallows them with a non-JSON 500-class body.
+  mvc:
+    throw-exception-if-no-handler-found: true
+  jackson:
+    default-property-inclusion: non_null
+
+server:
+  port: 8080
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    root: INFO
+    com.fintech.payment: DEBUG
+    org.hibernate.SQL: INFO

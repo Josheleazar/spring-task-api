@@ -1,0 +1,16 @@
+# Prod profile — PostgreSQL, explicit credentials, no auto DDL.
+# Schema migrations (Flyway) will be wired in a later phase.
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:payments}
+    username: ${DB_USER:payments}
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 4
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
