@@ -101,8 +101,18 @@ public class AccountService {
      * source→target edge against {@link #ALLOWED_TRANSITIONS}, and (for
      * {@code → CLOSED}) the FR-1.5 zero-balance rule. The save round-trip lets the
      * {@code @Version} column perform optimistic-lock detection.
+     *
+     * <p>Phase 5: {@code @Audited} interceptor observes the status transition,
+     * writing one row to {@code audit_logs} per successful status change. The
+     * audit write is deferred to {@code afterCommit} via
+     * {@link com.fintech.payment.audit.AuditAspect}, so a rolled-back
+     * transaction produces no audit row.</p>
      */
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "ACCOUNT",
+            action = com.fintech.payment.model.enums.AuditAction.STATUS_CHANGE,
+            entityIdArg = "id")
     public AccountResponse updateAccountStatus(UUID id, AccountStatus newStatus, String reason) {
         Account account = accountRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Account", id));
@@ -136,17 +146,41 @@ public class AccountService {
      * call to a read-write transaction.
      */
 
+    /**
+     * Phase 5 fix (per §12.5.1 reviewer MUST-FIX): the {@code @Audited} annotation
+     * would be bypassed if relied on the underlying {@code updateAccountStatus}
+     * method alone — helpers self-invoke {@code this.…}, which Spring AOP does
+     * not intercept (the §12.2.1 / §12.4.1 lesson, applied a third time). The
+     * {@code @Audited} annotation is therefore duplicated here so cross-bean
+     * calls through the controller reach the {@link AuditAspect} proxy.
+     *
+     * <p>Note: when a controller calls {@code updateAccountStatus} directly
+     * (rare today; legacy PATCH path), that method's own {@code @Audited}
+     * annotation fires correctly. Both annotations carry the same metadata.
+     */
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "ACCOUNT",
+            action = com.fintech.payment.model.enums.AuditAction.STATUS_CHANGE,
+            entityIdArg = "id")
     public AccountResponse freezeAccount(UUID id, String reason) {
         return updateAccountStatus(id, AccountStatus.FROZEN, reason);
     }
 
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "ACCOUNT",
+            action = com.fintech.payment.model.enums.AuditAction.STATUS_CHANGE,
+            entityIdArg = "id")
     public AccountResponse unfreezeAccount(UUID id, String reason) {
         return updateAccountStatus(id, AccountStatus.ACTIVE, reason);
     }
 
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "ACCOUNT",
+            action = com.fintech.payment.model.enums.AuditAction.STATUS_CHANGE,
+            entityIdArg = "id")
     public AccountResponse closeAccount(UUID id, String reason) {
         return updateAccountStatus(id, AccountStatus.CLOSED, reason);
     }

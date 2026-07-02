@@ -3,6 +3,7 @@ package com.fintech.payment.service;
 import com.fintech.payment.exception.SettlementBatchNotFoundException;
 import com.fintech.payment.model.dto.response.SettlementResponse;
 import com.fintech.payment.model.entity.SettlementBatch;
+import com.fintech.payment.model.enums.AuditAction;
 import com.fintech.payment.model.enums.SettlementStatus;
 import com.fintech.payment.repository.SettlementRepository;
 import lombok.RequiredArgsConstructor;
@@ -44,6 +45,7 @@ public class SettlementService {
 
     private final SettlementRepository settlementRepository;
     private final SettlementWorker settlementWorker;
+    private final com.fintech.payment.service.AuditService auditService;
     private final Clock clock;
 
     /* -------------------- FR-3.1: Daily batch creation -------------------- */
@@ -66,6 +68,20 @@ public class SettlementService {
             batch.setCurrency("USD");  // FR-3.1 KISS — one batch per day, USD-aggregate only
             SettlementBatch saved = settlementRepository.save(batch);
             log.info("Created settlement batch id={} for {}", saved.getId(), today);
+            // Phase 5: emit the BATCH_OPEN audit row programmatically. The
+            // @Audited annotation is argument-driven (entityIdArg = "batchId")
+            // and would not fit a no-arg @Scheduled tick; the alternative
+            // shape (post-proceed return-value resolution on the @Scheduled
+            // method) is documented in §12.5 as a Phase-6 hardening path.
+            // AuditService.record() runs in REQUIRES_NEW so the audit row
+            // commits independently of the daily-tick's persistence.
+            auditService.record(
+                    AuditAction.BATCH_OPEN,
+                    "SETTLEMENT_BATCH",
+                    saved.getId(),
+                    null,
+                    null,
+                    "system");
             // Trigger the worker — @Async + @Retryable wraps the actual processing.
             settlementWorker.processBatchAsync(saved.getId());
         } catch (DataIntegrityViolationException ex) {

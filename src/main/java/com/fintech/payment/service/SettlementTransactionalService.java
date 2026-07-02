@@ -84,7 +84,16 @@ public class SettlementTransactionalService {
      * concurrently bumped raises {@code OptimisticLockingFailureException}
      * which propagates up to {@link SettlementWorker#processBatchAsync}'s
      * {@code @Retryable} boundary and triggers a retry of the whole batch.</p>
+     *
+     * <p>Phase 5: {@code @Audited} interceptor observes the batch-finalize
+     * event; one {@code BATCH_SETTLED} audit row is written per successful
+     * settlement. The aspect's {@code afterCommit} pattern defeats phantom
+     * audits on the worker's {@code @Retryable} rollback path.</p>
      */
+    @com.fintech.payment.audit.Audited(
+            entityType = "SETTLEMENT_BATCH",
+            action = com.fintech.payment.model.enums.AuditAction.BATCH_SETTLED,
+            entityIdArg = "batchId")
     public void processBatchTransactional(UUID batchId) {
         SettlementBatch batch = settlementRepository.findById(batchId)
                 .orElseThrow(() -> new IllegalStateException(

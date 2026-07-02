@@ -68,7 +68,17 @@ public class PaymentService {
      * {@link com.fintech.payment.exception.GlobalExceptionHandler}
      * maps to {@code 409 IDEMPOTENCY_KEY_CONFLICT}.</p>
      */
+    /**
+     * Phase 5: emits a CREATED audit row on commit. The aspect snapshots
+     * {@code idempotencyKey} (or whichever entityIdArg resolves) before
+     * {@link #paymentRepository}.save — though the row was already in
+     * hand pre-save. Audit interceptor does not fail the call if the
+     * audit write fails; logged at {@code WARN}.
+     */
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "PAYMENT",
+            action = com.fintech.payment.model.enums.AuditAction.CREATED)
     public PaymentResponse submitPayment(String idempotencyKey, SubmitPaymentRequest request) {
         // 1. Source account — must exist and be ACTIVE (FR-2.4)
         Account source = accountRepository.findById(request.sourceAccountId())
@@ -157,6 +167,10 @@ public class PaymentService {
      * {@link InvalidPaymentStateException}.</p>
      */
     @Transactional
+    @com.fintech.payment.audit.Audited(
+            entityType = "PAYMENT",
+            action = com.fintech.payment.model.enums.AuditAction.REVERSED,
+            entityIdArg = "id")
     public PaymentResponse reversePayment(UUID id, String reason) {
         Payment payment = paymentRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Payment", id));

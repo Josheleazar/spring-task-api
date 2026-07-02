@@ -897,6 +897,101 @@ These items were deliberately deferred from Phase 4 and recorded here so Phase 5
 - `SettlementWorker.processBatchAsync` carries both `@Async` and `@Retryable`. A Mockito `@SpyBean` on a `@Service` whose AOP proxy intercepts first means `verify(spy, times(3))` will see **one** call (the proxy's call to the actual method), not three retries. Direct FR-3.4 retry verification needs `@SpringBootTest` with a `@MockitoBean` that throws `OptimisticLockingFailureException` once then succeeds on the second invocation. Plan for Phase 6.
 - `SettlementRepositoryTest$UniqueConstraintOnBatchDate` exercises the SQL-23505 catch path; the broad `DataIntegrityViolationException` catch in `SettlementService.createDailyBatch` covers both H2 PG-compat and (per §12.3.3 marker-walk precedent) Postgres identity-violation message formats.
 
-### 12.5 Future-phase drift
+### 12.5 Phase 5 — Audit & Compliance (committed)
 
-Reserved. Phase 5 (Audit & Compliance) will append here.
+Landed the FR-4.x audit + reporting surface on top of Phase 4. The
+audit layer is wired through a custom {@code @Audited} annotation
+intercepted by an {@code @Aspect} that defers writes to
+{@code TransactionSynchronization.afterCommit()} — defeating the
+phantom-audit-on-rollback defect that {@code @AfterReturning} alone
+would emit. Phase-3/4 envelopes preserved: the §12.4.2-deferred
+createPending/completePayment split remains deferred-III, so the existing
+71 Phase-3/4 test assertions still pass identically.
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `AuditAction` enum | §3.5 says `action` is a String | 7-value enum (`CREATED / STATUS_CHANGE / REVERSED / BATCH_OPEN / BATCH_SETTLED / BATCH_FAILED / RECONCILED`) — column is `@Enumerated(STRING)` so future verbs append without a schema change | String-typed actions in JSON would lack compile-time safety; enum preserves §8 envelope contract while giving IDE auto-completion. |
+| `AuditLog` entity shape | §3.5 lists 8 columns | 8 spec-compliant columns + composite index `(entity_type, entity_id)` for FR-4.2 + DESC index on `created_at` for chronological queries. NO `@Version`, NO `@LastModifiedDate` — append-only invariant per §6 NFR (Audit Immutability) | An AuditLog row is immutable evidence — no version-bump column. @CreatedDate drives the only timestamp; the entity has Lombok `@Setter` so Spring Data can construct it (Phase-6 polish item to drop setters entirely). |
+| Audit-write timing pattern | implicitly behind an AOP interceptor | `@Around` advice on `@Audited` methods registers a `TransactionSynchronization.afterCommit()` callback via `TransactionSynchronizationManager` | The phantom-audit defect class: an `@AfterReturning` advice fires when the host method's body returns successfully — BEFORE the @Transactional boundary commits. If the tx subsequently rolls back, an audit row would have been pre-inserted and would then disappear with the rolled-back business state. The `afterCommit` pattern is the canonical defence. |
+| `@Audited` annotation design | SRS §1.3 goal "AOP-based auditing" | Custom annotation carrying `entityType`, `action`, `entityIdArg` (default `"id"`), `performedBy` (default `"system"`) | Phase-5 KISS surface: arg-driven extraction. `entityIdArg` resolves via Spring's `DefaultParameterNameDiscoverer` — the `-parameters` compiler flag is on by Spring Boot 3.5.3's parent default. SpEL `oldValueSpel` / `newValueSpel` slots are documented as Phase-6 hardening; today's surface ships both columns `null`. |
+| `AuditAspect` cross-bean isolation | implied (Phase-2 §12.2.1 + Phase-4 §12.4.1 lessons) | Separate `@Aspect @Component` in `audit/` package; trivially outside the Service classes it intercepts | Spring AOP only works on cross-bean calls. The aspect lives in its own package by design so self-invocation within `AccountService`/`PaymentService`/`SettlementTransactionalService` correctly bypasses audit-aspect on inner methods. The §12.5.1 closure documents the third occurrence of the same gotcha. |
+| `AuditService.record(...)` propagation | not specified | `@Transactional(propagation = REQUIRES_NEW)` on the write method | The audit row lives independently of the calling service's transaction. Successful service commits → audit row persists; rolled-back service → audit row does NOT persist (via the `afterCommit` deferral AND the belt-and-braces `REQUIRES_NEW` propagation). |
+| `SettlementService.createDailyBatch` BATCH_OPEN audit write | not specified | programmatic `auditService.record(BATCH_OPEN, "SETTLEMENT_BATCH", saved.id, null, null, "system")` after `save(batch)` | The `@Scheduled` tick has no arg-driven entityId (signature is `void createDailyBatch()` with no parameters), so `@Audited(entityIdArg=…)` cannot resolve. Programmatic `record()` at the call site is cleaner than retrofitting the aspect with a post-proceed return-value extractor. Documented as deferred-II in §12.4.2 / forwarded to §12.5.2. |
+| `ReconciliationReportService` shape | FR-4.3 | dual entry: synchronous `generateReport(LocalDate)` (GET endpoint) + `@Scheduled(cron="0 30 0 * * *")` `prewarmYesterday()` (operationally visible without an HTTP round-trip) | GET computes on demand for any past date (422 for future dates via `ReconciliationReportUnavailableException`); the 30-min cron tick warms yesterday's tally at 00:30 UTC — 30 minutes after `SettlementService.createDailyBatch`'s 00:00 tick, leaving the @Async worker time to finalize. No persistent report row today (in-process `fromCache: false` always); Phase-6 hardening can introduce Redis / Caffeine caching. |
+| `AuditController` entityType allowlist | §5.4 silent on filter contract | allowlist `{"ACCOUNT", "PAYMENT", "SETTLEMENT_BATCH"}` enforced via `ValidationException` → 400 `VALIDATION_FAILED` | Guards against accidental full-table scans on `GET /api/v1/audit` without a filter. Phase 6 may add pagination cursors but the allowlist is the FR-4.1 / FR-4.2 principal-input discipline. |
+| `ReportsController` `GET /api/v1/reports/daily` envelope shape | §5.5 lists the path | matches spec exactly; 422 for future dates (per `ReconciliationReportUnavailableException`); 400 for malformed dates via the existing `TYPE_MISMATCH` handler | The handler reuses Phase-3/4 envelope machinery — no controller-specific exception family was added. |
+| Phase-3/4 envelope regression risk | implied | zero — Phase-2/3/4 test slices use `@MockitoBean AccountService`/`PaymentService`/`SettlementService`, and the AOP aspect only fires against real bean instances | Verified: 86/86 tests pass, with the Phase-2/3/4 71-test baseline unchanged. |
+| `AuditControllerTest` context-load wiring | §12.3.1 §12.3.1 forward-flag | `@MockitoBean IdempotencyService` stub mirroring the §12.3.1 verbatim pattern | Same root cause surfaced the same way: `@WebMvcTest` auto-loads `@Component` Filter beans (the `IdempotencyFilter`), and the filter's constructor requires `IdempotencyService`. The stub is purely context-wiring; the filter's `shouldNotFilter` predicate short-circuits for the test paths so the mock is never exercised. |
+
+**Phase-5 implementation notes the next phase should know:**
+
+- `AuditAspect.auditAnnotatedMethod` is the single-write chokepoint for all `@Audited` annotations. Any future audit-emitter (e.g. Phase-7's `PaymentGatewayClient` rejected-charge event) should add `@Audited(...)` to the new method — no aspect changes required.
+- `ReconciliationReportService.prewarmYesterday` is the only `RECONCILED` audit-row emitter today. New schedulers that emit periodic reports should reuse the same `AuditAction.RECONCILED` constant.
+- `AuditLog.@Setter` is a structural Phase-5 KISS carry-over; Phase-6 should drop it (the entity is append-only by convention; setters exist only so Spring Data's reflection-based construction can populate fields). See §12.5.2.
+- `SettlementService.createDailyBatch` programmatic `auditService.record(BATCH_OPEN)` is the seam where the `@Scheduled`-tick void-returning method emits an audit row. Phase-6 could collapse this into the @Audited mechanism by extending `@Audited` to support a post-proceed return-value extractor; document as forward-flag.
+- `AuditLog.id` UUID PK is generated via `GenerationType.UUID`; under heavy `RECONCILED` pre-warm tick rates this is fine (one row per day per phase). Under Phase-7 mock-client integration the rate may rise.
+
+**Phase 5 test-suite smoke (live `mvn test`, all green):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -Dtest='AuditLogRepositoryTest,AuditControllerTest' test` | BUILD SUCCESS, 15/15 pass |
+| `mvn -q test` (full-suite regression) | BUILD SUCCESS — 86/86, 0 failures, 0 errors |
+| Surefire per-class | Phase-2 (29) + Phase-3 (27) + Phase-4 (15) + Phase-5 (15) = 86 |
+| Closing reviewer pass on the patch | **APPROVE**, one forward-flag (RejectedExecutionException try/catch in `createDailyBatch`) — not a blocker |
+| Closing reviewer pass on the `@MockitoBean IdempotencyService` stub | **APPROVE** as the canonical §12.3.1-pattern fix |
+
+**Per-class counts (per `target/surefire-reports/*.txt`):**
+
+| Test class | Tests | FR coverage |
+|------------|------:|-------------|
+| `AccountRepositoryTest` | 10 | FR-1.1..1.5 (Phase 2) — reverted-to from §12.2.2 |
+| `AccountControllerTest` | 19 | FR-1.1..1.5 envelopes (Phase 2) |
+| `PaymentRepositoryTest` | 8 | FR-2.1..2.6 + reverse (Phase 3) |
+| `PaymentControllerTest` | 19 | FR-2.1..2.6 + reverse + idempotency replay (Phase 3 — §12.3.2) |
+| `SettlementRepositoryTest` | 8 | FR-3.1..3.5 persistence contract (Phase 4 — §12.4.2) |
+| `SettlementControllerTest` | 7 | FR-3.1..3.5 envelopes (Phase 4 — §12.4.2) |
+| `AuditLogRepositoryTest` | 7 | FR-4.1 + FR-4.2 + reconciliation window query (Phase 5) |
+| `AuditControllerTest` | 8 | FR-4.1/4.2 trails + FR-4.3 envelope matrix (Phase 5) |
+| **Total** | **86** | FR-1..4 envelope matrix fully covered at the MockMvc slice |
+
+### 12.5.1 Phase 5 — Self-invocation fix (committed)
+
+The block-reviewer on the initial Phase-5 ship caught the third
+occurrence of the §12.2.1 / §12.4.1 self-invocation gotcha:
+`AccountService.freezeAccount`/`unfreezeAccount`/`closeAccount` helpers
+self-invoke `this.updateAccountStatus(...)` via plain Java dispatch,
+bypassing the Spring AOP proxy. The `@Audited(entityType="ACCOUNT",
+action=STATUS_CHANGE, entityIdArg="id")` annotation on
+`updateAccountStatus` cannot fire under this call pattern — Phase-3/4
+proxies don't intercept intra-class invocations.
+
+| Item | Source | As-built after fix | Reason |
+|------|--------|--------------------|--------|
+| Helper `@Audited` annotation triplet | structural §12.2.1 / §12.4.1 lesson | `freezeAccount`/`unfreezeAccount`/`closeAccount` each carry their own `@Audited(entityType="ACCOUNT", action=STATUS_CHANGE, entityIdArg="id")` | The three helpers are public proxy entry points today — the controller's `PATCH /api/v1/accounts/{id}/status` path is what actually drives the call path in production git blame traces. Duplicating the annotation on the helpers themselves ensures the audit row is written for the controller-call path. The inner `updateAccountStatus`'s `@Audited` is dead-weight under helper-call paths but correct for direct-call paths (legacy code, future re-routing). |
+| `DomainException` constructor shape regression | previous turn (compile error) | both new exceptions changed `super(String)` → `super(String errorCode, String message)` | `DomainException` only exposes `(String, String)` and `(String, String, Throwable)`. The redundant `@Override getErrorCode()` removal aligns with the Phase-1 style on existing exceptions (`ResourceNotFoundException` puts `errorCode` in the constructor and doesn't override). |
+| `AuditControllerTest` context-load regression | @WebMvcTest auto-load + IdempotencyFilter constructor dependency | `@MockitoBean IdempotencyService` stub mirroring the §12.3.1 verbatim pattern | Same root cause as §12.3.1: the test slice auto-loads `@Component` Filter beans; `IdempotencyFilter` needs `IdempotencyService` to wire. The stub is context-wiring only — the filter's `shouldNotFilter` short-circuits for the test paths so the mock is never invoked. |
+
+### 12.5.2 Phase 5 — Forward-flag (deferred to Phase 6 hardening)
+
+The closing reviewer pass on the patch accepted these as not-blockers:
+
+| Item | Severity | Phase where it lands | Reason for deferral |
+|------|----------|----------------------|--------------------|
+| `SettlementService.createDailyBatch` `try/catch(RejectedExecutionException)` around the `@Async` `processBatchAsync` dispatch | forward-flag | Phase 6 (operational hardening) | The `@Scheduled` cron tick currently propagates a rejected-execution fault to the executor — leaving a stranded `BATCH_OPEN` audit row without an eventual `BATCH_SETTLED` audit row. Documented asymmetry; out-of-scope for Phase 5 KISS. The route through Phase 6 is a sentinel `WARN` log + re-attempt window, OR a graceful-degradation that flips `SettlementBatch.status=FAILED` directly when the executor rejects. |
+| `AuditLog` `@Setter` removal | minor | Phase 6 (entity-hygiene polish) | The entity has Lombok `@Setter` for Spring Data construction. Production-side mutation is forbidden by convention today (no setter caller in non-test code). Phase 6 should drop the setter entirely and expose a constructor-only API to make the immutability invariant machine-checkable. |
+| `@Audited` SpEL `oldValueSpel` / `newValueSpel` slots for richer state capture | minor | Phase 6 (audit-feature) | Phase-5 ships `oldValue` and `newValue` columns as nullable, always null. The annotation has documented hooks for SpEL expressions (`#result.status`, `#old.status`) but they aren't wired. Phase 6 can add `SpelExpressionParser` evaluation on a SpEL slot pair without breaking existing callers. |
+| `ReconciliationReportService` persistent report row | minor | Phase 6 (cache layer) | Today the report is always computed on demand. A persistent `reconciliation_reports` row would let GET return cached historical reports instantly, and would let `fromCache=true` carry semantic meaning in the envelope. Defer until a real cache layer (Redis / Caffeine) is on the classpath. |
+| `createPending` / `completePayment` split (the §12.3.3 deferred-II item, re-flagged for Phase 6)) | minor | Phase 6 (settlement semantics) | Still deferred. Phase-5 audit proves the seam is unnecessary today — `submitPayment` + `reversePayment` + the @Async batch finalize + the @Audited suffix provide all the observability we need. Reintroduced only if a future settlement-shape requirement demands a separate PENDING lifecycle. |
+| Phase-5 `ORCHESTRATING_BEHAVIOR` (worker `processBatchAsync` retry-verification at `@SpringBootTest`) | minor | Phase 6 (test hardening) | The §12.4.2 hermeticity note flags a Mockito-`@SpyBean` limitation (verify times(N) on a proxied AOP chain returns ONE call, not N retries). Phase 6 should add a `@SpringBootTest` with a `@MockitoBean` that throws once then succeeds on the second invocation to directly verify the retry-stack. |
+
+**Hermeticity notes the next phase should know:**
+
+- `@DataJpaTest` slices that touch an `AuditLog` should `@Import(AuditingConfig.class)` so `@CreatedDate` is exercised (the pattern mirrors Phase 2's `AccountRepositoryTest`).
+- The `@MockitoBean IdempotencyService` stub pattern from §12.3.1 is now canonical for ANY `@WebMvcTest` slice in this codebase. Future test pairs (`AuditControllerTest`-followers) should mirror it. Documented here to short-circuit the same context-load regression in Phase 6+.
+- `AuditAspect.auditAnnotatedMethod` uses `DefaultParameterNameDiscoverer`. Spring Boot 3.5.3's parent default enables `-parameters`; if the project ever pins to a custom maven-compiler-plugin that disables that flag, `@Audited` silently degrades — Playwright-style monitoring of the `WARN` log line `Parameter names not discoverable on ...` should be wired into Phase 6 test-infrastructure.
+- `AuditLog.id` is `UUID` not `BIGSERIAL`. Under the projected Phase-7 mock-client integration, audit volume may reach ~10³ rows/day, well within UUID v4 collision-probability margin (10⁻¹⁵/day). No change needed.
+
+### 12.6 Future-phase drift
+
+Reserved. Phase 6 (Testing & Polish) will append here.

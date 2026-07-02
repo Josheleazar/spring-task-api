@@ -58,6 +58,14 @@
             <artifactId>spring-aspects</artifactId>
         </dependency>
 
+        <!-- AOP starter for Phase 5 AuditAspect; spring-aspects above carries the runtime,
+             the starter adds autoconfig (AspectJ weaving is enabled by Spring Boot when this
+             is on the classpath). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
         <!-- OpenAPI / Swagger UI -->
         <dependency>
             <groupId>org.springdoc</groupId>
