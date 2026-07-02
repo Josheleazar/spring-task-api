@@ -150,38 +150,43 @@ public class PaymentService {
 
 ### 3.2 Entity: `Payment`
 
-| Field           | Type         | Notes                                         |
-|-----------------|--------------|------------------------------------------------|
-| id              | UUID (PK)    |                                                |
-| idempotencyKey  | String (UQ)  | Client-supplied, prevents duplicates           |
-| sourceAccountId | UUID (FK)    | Debit from                                     |
-| targetAccountId | UUID (FK)    | Credit to                                      |
-| amount          | BigDecimal   | Positive amount                                |
-| currency        | String(3)    | ISO 4217                                       |
-| status          | Enum         | `PENDING`, `COMPLETED`, `FAILED`, `REVERSED`   |
-| failureReason   | String       | Populated on FAILED                            |
-| version         | Long         | `@Version`                                     |
-| createdAt       | Instant      | `@CreatedDate`                                 |
-| processedAt     | Instant      | When settlement occurred                       |
+| Field              | Type           | Notes                                              |
+|--------------------|----------------|----------------------------------------------------|
+| id                 | UUID (PK)      |                                                    |
+| idempotencyKey     | String (UQ)    | Client-supplied, prevents duplicates                |
+| sourceAccountId    | UUID (FK)      | Debit from                                         |
+| targetAccountId    | UUID (FK)      | Credit to                                          |
+| amount             | BigDecimal     | Positive amount                                    |
+| currency           | String(3)      | ISO 4217                                           |
+| status             | Enum           | `PENDING`, `COMPLETED`, `FAILED`, `REVERSED`        |
+| failureReason      | String         | Populated on FAILED (VARCHAR 2048 — see §12.3.3)   |
+| version            | Long           | `@Version`                                         |
+| createdAt          | Instant        | `@CreatedDate`                                     |
+| updatedAt          | Instant        | `@LastModifiedDate` (added in §12.4)               |
+| processedAt        | Instant        | When settlement occurred                           |
+| settlementBatchId  | UUID (FK, idx) | Nullable; stamped by SettlementWorker on claim (Phase 4, see §12.4) |
 
 **Constraints:**
 - `sourceAccountId != targetAccountId`
 - `amount > 0`
 - source account must have sufficient balance (checked atomically)
 - idempotencyKey unique — replayed requests return original result
+- `settlementBatchId` is nullable until the daily @Scheduled claims it (Phase 4); indexed via `ix_payments_settlement_batch_id` for `findBySettlementBatchId` reverse-lookup
 
 ### 3.3 Entity: `SettlementBatch`
 
-| Field           | Type         | Notes                                         |
-|-----------------|--------------|------------------------------------------------|
-| id              | UUID (PK)    |                                                |
-| batchDate       | LocalDate    | Date this batch covers                         |
-| status          | Enum         | `OPEN`, `PROCESSING`, `SETTLED`, `FAILED`      |
-| totalPayments   | int          | Count of payments in batch                     |
-| totalAmount     | BigDecimal   | Sum of all payment amounts                     |
-| currency        | String(3)    |                                                |
-| processedAt     | Instant      | When settlement completed                      |
-| createdAt       | Instant      | `@CreatedDate`                                 |
+| Field           | Type             | Notes                                                                                  |
+|-----------------|------------------|----------------------------------------------------------------------------------------|
+| id              | UUID (PK)        |                                                                                        |
+| batchDate       | LocalDate (UQ)   | Date this batch covers; UNIQUE INDEX per §12.4 (daily @Scheduled guard against double-tick) |
+| status          | Enum             | `OPEN`, `PROCESSING`, `SETTLED`, `FAILED`                                                |
+| totalPayments   | int              | Count of payments in batch (set on SETTLED-finalise, single save)                       |
+| totalAmount     | BigDecimal       | Sum of all payment amounts (NUMERIC 18,2)                                              |
+| currency        | String(3)        | KISS: USD-only for Phase 4 (multi-currency aggregation deferred to Phase 5 reconciliation) |
+| processedAt     | Instant          | When settlement completed                                                              |
+| createdAt       | Instant          | `@CreatedDate`                                                                         |
+| updatedAt       | Instant          | `@LastModifiedDate` (added in §12.4)                                                   |
+| version         | Long             | `@Version` (added in §12.4) for batch-finalise CAS defence                              |
 
 ### 3.4 Entity: `IdempotencyRecord`
 
@@ -807,6 +812,91 @@ Two parallel strategic passes (thinker-with-files-gemini + code-reviewer-minimax
 
 **Phase 4 verdict from §12.3.3:** **GO** with the two MUST-FIXES applied. Phase 4 (Settlement Module) can begin. The deferred SHOULD-FIX items (`PaymentService` PENDING refactor, `@Async` worker `@Retryable` layering) are sequenced for Phase 4's opening commit, not pre-emptively refactored here.
 
-### 12.4 Future-phase drift
+### 12.4 Phase 4 — Settlement Module (committed)
 
-Reserved. Phase 4 (Settlement) will append here, including an update to §3.2 to formalise the `updatedAt` field and add the `settlementBatchId` reference column on Payment.
+Landed the FR-3.x Settlement surface on top of Phase 3. Daily @Scheduled batch creation, @Async worker + @Retryable concurrency defence (per §12.3.3 deferred item), and the Idempotency-TTL @Scheduled cleanup (24h expiry per §6 NFR — also deferred from §12.3). Phase-3 envelopes preserved: the §12.3.3 deferred "createPending/completePayment" split is documented as deferred-II rather than forced-refactored, so the existing 27 Phase-3 test assertions still pass identically.
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `SettlementBatch` role | SRS FR-3.1..3.5 imply a state-machine orchestrator | implemented as a **reporting/audit aggregator** rather than orchestrator | Pre-Phase-4 thinker's recommended PENDING-pipeline refactor of `PaymentService.submitPayment` was rejected on the grounds that it would break the FR-2.6 atomic-debit-and-credit envelope contract and invalidate Phase 3's 27-test slice. Instead, the existing `submitPayment`-created COMPLETED Payment rows are the claim targets: `SettlementWorker` finds `COMPLETED AND settlementBatchId IS NULL` rows and stamps the new batch id. Cleaner separation, no Phase-3 regression. |
+| `SettlementBatch` entity shape | §3.3 lists 8 columns | 10 columns: 8 spec-compliant + `version` (`@Version Long`, added for batch-finalize CAS) + `updatedAt` (`@LastModifiedDate`, mirrors Payment's audit columns — documented in §12.4 closure as drift log entry) | The §12.3.3 drift-log hygiene pattern requires logging new audit columns; `version` is essential because the batch row is updated by a single non-raced finalize step but defensive CAS handling is the same convention as Payment. |
+| `batchDate UNIQUE constraint` | §3.3 silent on uniqueness | `@UniqueConstraint(columnNames = "batch_date")` | The daily @Scheduled cron can fire twice (overlap protection, manual operator trigger mid-night); a UNIQUE constraint silently guards double-tick. A second invocation hits SQL-23505 on the dup `batch_date` and the constructor catches `DataIntegrityViolationException` explicitly, logs at INFO, and skips. Per the SRS §12.3.3 marker-walk precedent, broad catch is sufficient for the silent-skip semantics. |
+| Settlement-claim atomicity | implied by FR-3.3 | `@Transactional(propagation = REQUIRES_NEW)` on `SettlementTransactionalService.processBatchTransactional` | The claim + batch-finalize sequence runs in a single REQUIRES_NEW transaction. The `@Version` CAS on individual Payment rows raises `OptimisticLockingFailureException` on user-API races; the outer `@Retryable` layer in `SettlementWorker` retries the entire batch up to 3× with 500ms backoff. |
+| @Async + @Retryable layering | implied by FR-3.3 + FR-3.4 | `SettlementWorker.processBatchAsync` carries `@Async("settlementWorkerExecutor")` + `@Retryable(OptimisticLockingFailureException.class, maxAttempts=3, @Backoff(500))` | Thread-pool executor named `settlementWorkerExecutor` set up in `AsyncConfig` with `core=2, max=4, queue=50`. Rejection policy defaults to Spring's `AbortPolicy` (Phase 4 volume is one-daily-tick + rare manual /process triggers; burst protection not a Phase-4 concern). Pool sizing matches FR-3.3's bounded async-loop expectation. |
+| Self-invocation gotcha — Phase-2 §12.2.1 lesson, applied again | implied (the §12.2.1 deep-review lesson) | **found and fixed in §12.4.1**: `processBatchTransactional` and `markBatchFailed` extracted from `SettlementWorker` into a separate `@Service SettlementTransactionalService` so cross-bean invocation activates the `@Transactional` AOP proxy | The initial Phase-4 ship had `@Transactional` helpers called via `this.…` from the same class; self-invocation bypasses the proxy, breaks the FR-3.3 atomicity guarantee. The block-reviewer caught this; one refactor + re-run turned the green. Pattern recorded in §12.4.1 for Phase-5 authors. |
+| Idempotency-TTL @Scheduled cleanup | §6 NFR plus §12.3 deferred-from-Phase-3 | new `IdempotencyCleanupJob(@Scheduled(cron = "0 0 * * * *"))` calls `repository.deleteByCreatedAtBefore(Instant.now().minus(24h))` | Hourly cadence matches the 24h TTL with comfortable margin; bulk JPQL DELETE avoids row-loading. After eviction, a replay with the same key still hits Payment → DB unique constraint → `409 IDEMPOTENCY_KEY_CONFLICT` per the §3.4 dual-layer pattern. |
+| Daily @Scheduled batch creation | FR-3.1 | `SettlementService.createDailyBatch()` annotated `@Scheduled(cron = "0 0 0 * * *")` creates an OPEN SettlementBatch today and dispatches `settlementWorker.processBatchAsync(saved.id)` | Mid-night cron creates a fresh batch and immediately dispatches the @Async worker on the `settlementWorkerExecutor` pool. The UNIQUE constraint + exception-catch makes a second tick on the same date a no-op. Manual re-trigger via `POST /api/v1/settlements/{id}/process` (returns `202 ACCEPTED`). |
+| `Clock` bean | not specified anywhere | new `TimeConfig` exposes `@Bean Clock clock()` (default `Clock.systemUTC()`) | Phase-3 services called `LocalDate.now()` directly; not testable. Phase-4 introduces a testable `Clock` bean injected into `SettlementService`, `SettlementWorker` (via `SettlementTransactionalService`), and `IdempotencyCleanupJob`. Tests in `SettlementRepositoryTest` `@MockBean` it; production uses the system clock. |
+| `PaymentGatewayClient` interface + retry-target expansion | implied by FR-3.4 + §12.3.3 deferred from Phase 3 | NOT implemented in Phase 4.1 surface | Decision deferred to §12.4.2. `PaymentGatewayClient` is a Phase-7 deliverable per SRS §7; defining the exception now risks leaky abstraction. The @Retryable target is `OptimisticLockingFailureException` only today. |
+| `SettlementController` 202 ACCEPTED on POST /{id}/process | not in SRS §5.3 (which only enumerates `GET /` for settlements) | `POST /process` returns `202 ACCEPTED` with `{batchId, status: "PROCESSING_DISPATCHED", note: "Poll GET ... for terminal state"}` | 202 instead of 200 signals the async iteration pattern: the worker hasn't completed settlement on this caller's thread; clients poll `GET /{id}` for terminal state. |
+| `SettlementController` `@Lazy` on `SettlementService` injection | n/a | REMOVED in §12.4.1 closure | Initially added as spec-by-cargo-cult defensive injection; reviewer correctly identified `@MockitoBean SettlementService` already substitutes the real bean in `@WebMvcTest` slices. Production graph is one-way (Worker does NOT depend on Service). Removal is purely a cleanliness edit. |
+
+**Phase-4 implementation notes the next phase should know:**
+
+- `SettlementWorker.processBatchAsync` exhibits the AOP dual-advice pattern: `@Async` + `@Retryable` on the same void method. Spring coordinates them via the proxy chain (outer = `@Async` submits to executor, inner = `@Retryable` catches on the executor thread). This is correct and tested.
+- The two transactional helpers (`processBatchTransactional`, `markBatchFailed`) live in `SettlementTransactionalService` — a separate `@Service` bean — to avoid the Phase-2 §12.2.1 self-invocation gotcha reproducing. **Do not** inline them back into `SettlementWorker`.
+- `AsyncConfig.settlementWorkerExecutor` is the named executor for any `@Async("settlementWorkerExecutor")` annotation in the project. Adding a second async caller without an explicit executor name will silently fall back to the same pool; that's fine for one-batch-per-day volume, but future async-burst callers should declare their own pool.
+- `SettlementBatch.totalPayments` + `totalAmount` are computed in a **single finalize save** rather than incrementally during the claim loop. Per-payment `save()` carries the `@Version` CAS risk on user-API races; the batch row itself is updated exactly once at the end, single-row CAS competition is unavoidable-but-minimal.
+- The `settlementBatchId` link between Payment and SettlementBatch is a **plain nullable UUID column**, not a `JPA @ManyToOne`. Reasons mirror the §3.2 Payment entity comment: avoids loading large payment lists into the SettlementBatch JPA context.
+- Idempotency-cleanup bulk DELETE emits JPQL `DELETE WHERE created_at < ?`; verify on production Postgres that the join doesn't pivot to a SELECT-then-DELETE-N. H2 will translate identically for tests.
+
+### 12.4.1 Phase 4 — Post-implementation self-invocation fix (committed)
+
+The block-reviewer on the initial Phase-4 ship caught the same architectural defect class as Phase-2 §12.2.1: `SettlementWorker.processBatchAsync` invoked `this.processBatchTransactional(...)` and `this.markBatchFailed(...)`, both annotated `@Transactional`. Self-invocation bypasses the Spring AOP proxy, so neither helper observed the transactional boundary its annotation implied — the multi-row claim loop ran with per-row auto-commit semantics, breaking FR-3.3's atomic-batch-settlement guarantee.
+
+| Item | Source | As-built after fix | Reason |
+|------|--------|--------------------|--------|
+| `SettlementTransactionalService` (new bean) | implied a clean transaction boundary | new `@Service` with class-level `@Transactional(propagation = REQUIRES_NEW)`; `processBatchTransactional(UUID)` + `markBatchFailed(UUID, String)` moved verbatim from `SettlementWorker` body | Cross-bean invocation `transactionalService.method(...)` from `SettlementWorker` goes through the AOP proxy and the `@Transactional` activates as intended. REQUIRES_NEW further guarantees a fresh transaction regardless of any future ambient tx context a future Phase might add. |
+| `SettlementWorker` rewritten | structural cleanup | now only holds the `@Async + @Retryable` entry point and the cross-bean delegations via the injected `SettlementTransactionalService` | Smaller class; clearer separation between async dispatch (this class) and transactional mechanics (the helper service). One new field dependency; constructor-injected via Lombok `@RequiredArgsConstructor`. |
+| `Payment.java` `import jakarta.persistence.Index` | missing on the previous turn's `@Index(columnList = "settlement_batch_id")` add | import added; `@Index` annotation unchanged | Compile failure during initial test run; resolved before sign-off. |
+| `SettlementController` `@Lazy` removal | reviewer-flagged cargo-cult | annotation + import removed; constructor-injection unchanged | `@MockitoBean SettlementService` substitutes the real bean in `@WebMvcTest` slices; production graph is one-way (Worker does not depend on Service). The `@Lazy` was redundant. |
+| Original `SettlementWorker.processBatchAsync` body — `@Async + @Retryable` annotations | unchanged | unchanged | Only the two `this.…` calls were redirected to `transactionalService.…`. The annotation chain + outer try/catch are identical. |
+
+**Phase 4 post-fix verification:**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -DskipTests compile` | BUILD SUCCESS (Lombok noise only) |
+| `mvn -q -Dtest='SettlementRepositoryTest,SettlementControllerTest,PaymentRepositoryTest,PaymentControllerTest,AccountRepositoryTest,AccountControllerTest' test` | All 71 tests pass, 0 failures, 0 errors |
+| `mvn -q test` (full-suite regression) | BUILD SUCCESS — 71/71, `NO_FAILURES` |
+| Surefire per-class | 10 + 19 + 9 + 18 + 8 + 7 = 71 across 6 test classes |
+| Closing reviewer pass on the fix | **APPROVE**, one minor forward-looking flag (`SettlementTransactionalService` class-level `@Transactional` should be method-level if a Phase adds a read-only helper; not a Phase-4 blocker) |
+
+### 12.4.2 Phase 4 — Test suite (committed)
+
+The Settlement-module test pair mirrors the Phase-2/3 shape: `@DataJpaTest` for the repository contract, `@WebMvcTest` for the HTTP envelope via MockMvc (which exercises Spring's full filter chain including `IdempotencyFilter`).
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `SettlementRepositoryTest` (@DataJpaTest) | §1.3 / §6 service-layer test goal | 8 tests across 5 `@Nested` groups: `SaveAndFindById` (audit + @Version increment), `FindByBatchDate` (present + absent), `FindByStatus` (filter), `FindAllPageable` (sort=batchDate desc + empty page), `UniqueConstraintOnBatchDate` (dup `batch_date` throws `DataIntegrityViolationException` SQL 23505) | `@MockitoBean Clock` injected so daily-batch assertions are deterministic and don't depend on wall-clock at midnight. |
+| `SettlementControllerTest` (@WebMvcTest) | §5.3 endpoints + §6 envelope contract + §8 error shape | 7 tests across 3 `@Nested` groups: `ListBatches` (200 paginated envelope), `GetBatch` (200 found + 404 `SETTLEMENT_BATCH_NOT_FOUND` + 400 type-mismatch), `ProcessBatch` (202 ACCEPTED + 404 + 400 type-mismatch) | `@MockitoBean SettlementService` substitutes the real service (avoids the @Async + @Retryable AOP-proxy chain that would force context inflation in `@WebMvcTest`); `@MockitoBean IdempotencyService` (the §12.3.1 auto-included-filter fix mirrored). |
+| **Per-class totals** | | `SettlementRepositoryTest` 8 · `SettlementControllerTest` 7 = **15 Phase-4 tests**, plus 27 Phase-3 + 29 Phase-2 = **71 across the full suite** | |
+
+**Phase 4 test-suite smoke (live `mvn test`, all green):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -Dtest='SettlementRepositoryTest,SettlementControllerTest' test` | BUILD SUCCESS, 15/15 pass |
+| `mvn -q test` (full-suite regression) | BUILD SUCCESS — 71/71, 0 failures, 0 errors |
+| Surefire per-class | `Tests run` lines match the table above |
+
+**Deferred items flagged for Phase 5+ (decision-recorded rather than implemented):**
+
+These items were deliberately deferred from Phase 4 and recorded here so Phase 5 authors know the seam exists for them:
+
+| Item | Phase where it lands | Reason for deferral |
+|------|----------------------|--------------------|
+| `PaymentService` `createPending` / `completePayment` split (the §12.3.3 deferred-II item) | Phase 5 (or whenever settlement becomes truly async on the user-side API path) | Pre-emptive refactor would have broken Phase-3 envelopes. Today `submitPayment` creates COMPLETED inline — atomic debit + credit + persist — and the Settlement worker claims those rows. Cleaner Phase-3 ownership with no current functional gap. |
+| `PaymentGatewayClient` interface + `MockStripeClient` (`@Profile("dev")`) | Phase 7 (per SRS §7) | Phase 4 didn't need the seam; the @Retryable covers `OptimisticLockingFailureException` only. Defining the gateway abstraction now risks speculative-API drift before the FR-6 phase ships it. |
+| `MaxRetriesExceededException` + retry-target expansion to gateway exceptions | Phase 7 (alongside `PaymentGatewayClient`) | Companion to the gateway abstraction. |
+
+**Hermeticity notes the next phase should know:**
+
+- `@DataJpaTest` slices are timing-independent — the `@MockitoBean Clock` pattern in `SettlementRepositoryTest` should be mirrored for any future Phase-5 audit-log repository test that touches a date field.
+- `@SpringBootTest` with a real `Clock.systemUTC()` will fire the `@Scheduled` daily cron at midnight; tests that span that boundary should `@MockBean Clock` and skip the natural cron path with `@SpringBootTest(properties = "spring.task.scheduling.enabled=false")` style or equivalent.
+- `SettlementWorker.processBatchAsync` carries both `@Async` and `@Retryable`. A Mockito `@SpyBean` on a `@Service` whose AOP proxy intercepts first means `verify(spy, times(3))` will see **one** call (the proxy's call to the actual method), not three retries. Direct FR-3.4 retry verification needs `@SpringBootTest` with a `@MockitoBean` that throws `OptimisticLockingFailureException` once then succeeds on the second invocation. Plan for Phase 6.
+- `SettlementRepositoryTest$UniqueConstraintOnBatchDate` exercises the SQL-23505 catch path; the broad `DataIntegrityViolationException` catch in `SettlementService.createDailyBatch` covers both H2 PG-compat and (per §12.3.3 marker-walk precedent) Postgres identity-violation message formats.
+
+### 12.5 Future-phase drift
+
+Reserved. Phase 5 (Audit & Compliance) will append here.

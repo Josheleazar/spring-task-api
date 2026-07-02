@@ -9,6 +9,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
 import jakarta.persistence.Version;
@@ -55,7 +56,10 @@ import java.util.UUID;
 @Table(name = "payments",
         uniqueConstraints = @UniqueConstraint(
                 name = "uk_payments_idempotency_key",
-                columnNames = "idempotency_key"))
+                columnNames = "idempotency_key"),
+        indexes = {
+                @Index(name = "ix_payments_settlement_batch_id", columnList = "settlement_batch_id")
+        })
 @EntityListeners(AuditingEntityListener.class)
 @Getter
 @Setter
@@ -104,4 +108,15 @@ public class Payment {
 
     @Column(name = "processed_at")
     private Instant processedAt;
+
+    /**
+     * Phase 4 — SettlementBatch reference. Nullable until the daily batch
+     * worker claims the Payment row (status=COMPLETED, settlementBatchId IS NULL).
+     * Carries the batch UUID as a plain column rather than a JPA
+     * {@code @ManyToOne} — see the Phase-3 class Javadoc note on lag-free
+     * reads of large payment lists. Indexed via {@code ix_payments_settlement_batch_id}
+     * for the {@code findBySettlementBatchId} reverse-lookup.
+     */
+    @Column(name = "settlement_batch_id")
+    private UUID settlementBatchId;
 }
