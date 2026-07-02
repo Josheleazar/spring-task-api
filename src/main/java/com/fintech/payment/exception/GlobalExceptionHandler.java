@@ -13,6 +13,7 @@ import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -33,6 +34,20 @@ import java.util.stream.Collectors;
  * <p>Domain exceptions declare their own HTTP status via
  * {@link DomainException#getHttpStatus()}, so this handler is single-pass
  * for the entire {@code DomainException} family.</p>
+ *
+ * <p>Phase 3 deltas:</p>
+ * <ul>
+ *   <li>New {@code MissingRequestHeaderException} handler — used by
+ *       {@code POST /api/v1/payments} to flag a missing
+ *       {@code Idempotency-Key} header.</li>
+ *   <li>{@code DataIntegrityViolationException} now distinguishes the
+ *       {@code uk_payments_idempotency_key} uniqueness violation
+ *       (TOCTOU race on a brand-new key) from any other uniqueness
+ *       violation. The idempotency-key case maps to
+ *       {@code 409 IDEMPOTENCY_KEY_CONFLICT} with
+ *       {@code details.retryable=true} so clients polling for the settled
+ *       record can confidently retry.</li>
+ * </ul>
  */
 @RestControllerAdvice
 @Slf4j
@@ -123,45 +138,51 @@ public class GlobalExceptionHandler {
     /* -------------------- Data integrity --------------------
      *
      * Backstop for unique-constraint violations that slip past the service-level
-     * {@code existsBy<UniqueField>(...)} check (TOCTOU window) and pre-emptive
-     * handling for FK-error envelopes before Phase 3 introduces payment FKs.
-     * Splits the envelope by ANSI SQL state:
+     * check (TOCTOU window) and pre-emptive handling for FK-error envelopes now
+     * that Phase 3 introduces payment FKs (forward-looking). Splits the
+     * 23505 envelope by cause-message marker:
      *
-     *   23505 unique_violation          -> 409 DUPLICATE_RESOURCE
-     *   23503 foreign_key_violation     -> 404 REFERENCED_RESOURCE_NOT_FOUND
-     *   23502 not_null_violation        -> 422 DATA_INTEGRITY_VIOLATION
-     *   23514 check_violation           -> 422 DATA_INTEGRITY_VIOLATION
-     *   23000 generic integrity         -> 422 DATA_INTEGRITY_VIOLATION
+     *   23505 unique_violation + cause mentions "IDEMPOTENCY"  -> 409 IDEMPOTENCY_KEY_CONFLICT (retryable=true)
+     *   23505 unique_violation + anything else                  -> 409 DUPLICATE_RESOURCE
+     *   23503 foreign_key_violation                             -> 404 REFERENCED_RESOURCE_NOT_FOUND
+     *   23502 not_null_violation                                -> 422 DATA_INTEGRITY_VIOLATION
+     *   23514 check_violation                                   -> 422 DATA_INTEGRITY_VIOLATION
+     *   23000 generic integrity                                 -> 422 DATA_INTEGRITY_VIOLATION
      *
      * 404 is preferred over 422 for FK because the failure mode is uniformly
      * "this referenced id does not exist", which clients can act on by
      * re-fetching the referenced resource. 422 would conflate FK misses with
      * semantically-malformed bodies (regex / range failures).
-     *
-     * Every envelope carries {@code details.sqlState} so client logs / dashboards
-     * never depend on parsing the message string to tell uniqueness from FK misses.
-     * See <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html">PostgreSQL errcodes</a>
-     * — H2 in PG-compat mode uses the same codes.
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiErrorResponse> handleIntegrity(DataIntegrityViolationException ex,
                                                              HttpServletRequest request) {
         log.debug("Data integrity violation at {}", request.getRequestURI(), ex);
         String sqlState = extractSqlState(ex);
-        Map<String, Object> details = sqlState == null ? null : Map.of("sqlState", sqlState);
+        Map<String, Object> baseDetails = sqlState == null ? null : Map.of("sqlState", sqlState);
+
         if ("23505".equals(sqlState)) {
+            if (containsCauseMessage(ex, "IDEMPOTENCY")) {
+                Map<String, Object> details = sqlState == null
+                        ? Map.of("retryable", Boolean.TRUE)
+                        : Map.of("retryable", Boolean.TRUE, "sqlState", sqlState);
+                return build(HttpStatus.CONFLICT, "IDEMPOTENCY_KEY_CONFLICT",
+                        "An Idempotency-Key with this value is already in flight. " +
+                                "Retry with the same key shortly to receive the cached response.",
+                        request, details, null);
+            }
             return build(HttpStatus.CONFLICT, "DUPLICATE_RESOURCE",
                     "A resource with these unique properties already exists",
-                    request, details, null);
+                    request, baseDetails, null);
         }
         if ("23503".equals(sqlState)) {
             return build(HttpStatus.NOT_FOUND, "REFERENCED_RESOURCE_NOT_FOUND",
                     "The request references a resource that does not exist",
-                    request, details, null);
+                    request, baseDetails, null);
         }
         return build(HttpStatus.UNPROCESSABLE_ENTITY, "DATA_INTEGRITY_VIOLATION",
                 "The request would violate a database constraint",
-                request, details, null);
+                request, baseDetails, null);
     }
 
     /**
@@ -185,6 +206,43 @@ public class GlobalExceptionHandler {
             current = next;
         }
         return null;
+    }
+
+    /**
+     * Walks the cause chain looking for a {@code Throwable} whose
+     * {@link Throwable#getMessage()} contains the supplied marker (case
+     * insensitive). Used to disambiguate which UNIQUE constraint fired in
+     * a 23505 envelope: H2 includes the constraint index name in the
+     * message string ("UK_PAYMENTS_IDEMPOTENCY_KEY_INDEX_...") so a
+     * substring match is the cheapest portable check across H2 and
+     * PostgreSQL.
+     */
+    private static boolean containsCauseMessage(Throwable t, String marker) {
+        Throwable current = t;
+        int depth = 0;
+        final int maxDepth = 32;
+        while (current != null && depth++ < maxDepth) {
+            String msg = current.getMessage();
+            if (msg != null && msg.toUpperCase().contains(marker.toUpperCase())) {
+                return true;
+            }
+            Throwable next = current.getCause();
+            if (next == current || next == null) break;
+            current = next;
+        }
+        return false;
+    }
+
+    /* -------------------- Headers (Phase 3) -------------------- */
+
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ApiErrorResponse> handleMissingHeader(MissingRequestHeaderException ex,
+                                                               HttpServletRequest request) {
+        log.debug("Missing required header '{}' at {}", ex.getHeaderName(), request.getRequestURI());
+        Map<String, Object> details = Map.of("header", ex.getHeaderName());
+        return build(HttpStatus.BAD_REQUEST, "MISSING_HEADER",
+                "Required header '%s' is missing".formatted(ex.getHeaderName()),
+                request, details, null);
     }
 
     /* -------------------- Validation -------------------- */

@@ -6,9 +6,11 @@ import com.fintech.payment.exception.DuplicateAccountNumberException;
 import com.fintech.payment.exception.GlobalExceptionHandler;
 import com.fintech.payment.exception.InvalidAccountStatusTransitionException;
 import com.fintech.payment.exception.ResourceNotFoundException;
+import com.fintech.payment.idempotency.IdempotencyFilter;
 import com.fintech.payment.model.dto.response.AccountResponse;
 import com.fintech.payment.model.enums.AccountStatus;
 import com.fintech.payment.service.AccountService;
+import com.fintech.payment.service.IdempotencyService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -73,6 +75,18 @@ class AccountControllerTest {
 
     @MockitoBean
     private AccountService accountService;
+
+    /**
+     * The {@link IdempotencyFilter} is a {@code @Component} that extends
+     * {@code OncePerRequestFilter}, and {@code @WebMvcTest} auto-includes
+     * {@code Filter} beans even when targeting a specific controller class.
+     * The filter requires {@link IdempotencyService} at construction time;
+     * we provide a Mockito stub so the application context starts successfully
+     * for {@code AccountControllerTest} (whose tests never hit the
+     * {@code IdempotencyFilter}'s scope — POST {@code /api/v1/payments}).
+     */
+    @MockitoBean
+    private IdempotencyService idempotencyService;
 
     /* -------------------- constants -------------------- */
 

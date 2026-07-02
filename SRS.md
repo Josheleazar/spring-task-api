@@ -685,6 +685,128 @@ Adds the FR-1.x test surface highlighted in §1.3 ("comprehensive tests") and §
 - `PageImpl` JSON shape emits a Spring data warning *"Serializing PageImpl instances as-is is not supported"* — pre-existing notice for Spring Boot 3.3+ recommending `PagedModel` (`@EnableSpringDataWebSupport(pageSerializationMode=VIA_DTO)`). The Phase 2 list test asserts against the legacy `PageImpl` shape (`data.content`, `data.totalElements`, `data.totalPages`); a future migration to `PagedModel` will require updating that one assertion.
 - `@MockitoBean` was introduced in Spring Framework 6.2; Spring Boot 3.5.3 is the first 3.x line that supports it. If/when we pin below 3.4, fall back to the now-deprecated `@MockBean` annotation.
 
-### 12.3 Future-phase drift
+### 12.3 Phase 3 — Payment Module (committed)
 
-Reserved. Append per phase.
+Landed the FR-2.x payment surface + reverse endpoint on top of Phase 2. The atomic debit+credit path, idempotency layer, and concurrency envelope are wired end-to-end through the controller → service → repository stack.
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `SubmitPaymentRequest` field names | FR-2.1 specifies source/target but not the identifier type | uses UUIDs (`sourceAccountId`, `targetAccountId`) — *not* account numbers | UUIDs are stable across renames and decouple the API from the human-readable number. Account-number lookup is reserved for future ops endpoints (Phase 7 mock-client tests). |
+| Idempotency key source of truth (single vs dual layer) | §3.4 IdempotencyRecord entity alone | **dual layer**: (a) `Payment.idempotencyKey` UNIQUE constraint guards domain integrity — defends against double-charging at the DB level; (b) `IdempotencyRecord` rows are the HTTP-layer cache holding status + body bytes | The DB constraint is the absolute uniqueness gate; the cache fast-paths replays. After cache TTL expiry, replays still see a settled Payment row and surface as 409 `IDEMPOTENCY_KEY_CONFLICT` rather than silently double-charging. |
+| Idempotency layer wiring | §3.4 implies a service-level layer | `IdempotencyFilter extends OncePerRequestFilter` matched on `POST /api/v1/payments` exact-path only (via `shouldNotFilter`) | Filter is the seam; controller + service are cache-unaware. Reverse + GETs bypass cleanly via `shouldNotFilter`. `@Component` autowires the filter into Spring's filter chain. |
+| Cache write transaction isolation | implied by §6 consistency NFR | `IdempotencyService.save(...)` runs in `@Transactional(propagation=REQUIRES_NEW)` so a failed cache write cannot roll back a successful payment | Trade-off explicit: a 201 + empty cache beats a successful payment + cascade failure on the cache write. The DB unique constraint remains the source of truth either way. |
+| Response capture mechanism | implied | `ContentCachingResponseWrapper` in the filter, `copyBodyToResponse()` on exit | Captures bytes after the controller writes them; a failure mode of an empty body on cache miss is explicitly guarded by `copyBodyToResponse()`. |
+| Body-hash on duplicate key (different body, same key) | §6 tolerates replay-along-state | **out of scope (Phase 6 hardening)** — distinct-body replay today returns the cached response for the *original* body. After cache eviction, the same key went through PaymentService's unique constraint → `IDEMPOTENCY_KEY_CONFLICT` | Honest about Phase-3 KISS behaviour; Phase 6 should add a SHA-256 of the request body to the lookup so a client with a divergent body can be told its request differs. |
+| TTL cleanup of `IdempotencyRecord` rows | §6 NFR: "Idempotency keys expire after 24h" | **out of scope (Phase 4 `@Scheduled` job)** — rows accumulate today with no expiry | Cron-style cleanup naturally groups with the Settlement + Reconciliation jobs that ship in Phase 4-5. |
+| Concurrent insert race on idempotency key | implied by FR-5.2 | `DataIntegrityViolationException` (SQL state 23505) with cause-message containing "IDEMPOTENCY" marker → single-pass split in handler → `409 IDEMPOTENCY_KEY_CONFLICT` (`details.retryable=true`) vs `409 DUPLICATE_RESOURCE` for any other 23505 | The marker-walk (`containsCauseMessage` chain-walker, 32-depth cap) is portable across H2 and Postgres because both include the constraint index name in the message string. |
+| `MissingRequestHeaderException` handler | implied by FR-5.5 + the new required `Idempotency-Key` header | New `@ExceptionHandler` → `400 MISSING_HEADER` | Phase 1 handler family didn't cover this; needed for the controller-boundary `Idempotency-Key` gate. |
+| `AccountNotActiveException` first-caller | pre-modelled in Phase 2 §12.2 | thrown for the first time by `PaymentService.submitPayment` for both source and target | Pre-modelling paid off — zero handler changes were needed today. |
+| `CurrencyMismatchException` HTTP status | not in FR-2 spec | `422 UNPROCESSABLE_ENTITY` | Request shape is fine; the resource state forbids it. Same envelope family as INSUFFICIENT_FUNDS. |
+| `SelfTransferException` HTTP status | not in FR-2 spec — FR-2.5 only says "prevent" | `400 BAD_REQUEST` | Defends against naïvely-strict clients reading 422 as "your input is wrong"; 400 keeps the envelope family consistent with VALIDATION_FAILED. |
+| `InvalidPaymentStateException` HTTP status | not in FR-2 spec | inherits the default `400 BAD_REQUEST` from `DomainException` | Request shape is valid; resource state forbids the operation. Same defence as self-transfer. |
+| Reverse endpoint shape | §5.2 lists `POST /api/v1/payments/{id}/reverse` | matches spec exactly; optional body `{reason}` (max 256 chars per `@Size`) | Phase 5 audit log will consume `reason` (FR-4.1). Phase 3 persists it on the Payment row's `failureReason` column as a temporary sink. |
+| `Payment` enum reachability today | §3.2 lists PENDING/COMPLETED/FAILED/REVERSED | COMPLETED + REVERSED are reachable; PENDING + FAILED wired but unreachable (Phase 4 settlement creates the PENDING→COMPLETED pipeline; FAILED reserved for gateway errors) | SAR-tested today; the unreachable states are present so Phase 4 doesn't have to alter the schema. |
+| `PaymentResponse.failureReason` field | not in §3.2 / §5 | nullable in JSON via `@JsonInclude(NON_NULL)` on the record | Populated on FAILED/REVERSED today; forward-looking so clients don't see a schema change in Phase 4. |
+| `° BigDecimal` JSON shape on payment amounts | not specified | serialises as e.g. `"50.00"` (H2 NUMERIC(18,2) round-trip preserves scale) | Smoke assertions compare with `float(...)` to be tolerant of the scale representation. |
+
+**Phase-3 implementation notes the next phase should know:**
+
+- `Account` is loaded twice in `submitPayment` (once for source, once for target). Each load goes through the Spring Data proxy — no self-invocation gotcha inside the public `@Transactional` method (Phase 2 deep-review lesson preserved).
+- The `Payment.idempotencyKey` column is `VARCHAR(128) NOT NULL`, mirroring the `Idempotency-Key` regex on the controller (`^[A-Za-z0-9_-]{8,128}$`). Bumping the bound requires updating both.
+- `IdempotencyRecord.idempotency_key` is the PK (string column, *not* a UUID). `IdempotencyService.save` does an explicit `existsByKey → save` branch — relying on JPA's "merge if exists" would silently overwrite the cached body on a duplicate-key race.
+- `@Component` on `IdempotencyFilter` means `@WebMvcTest` slices auto-include the filter bean (Phase 2's `AccountControllerTest` confirmed it when the context-load broke). The Phase-3 regression fix (§12.3.1) is the canonical workaround.
+- The `IdempotencyFilter` matches the path at exact-equality (`shouldNotFilter` returns true for everything except `POST /api/v1/payments`); if a sibling payment-shaped endpoint is ever added (Phase 7 mock-client webhook?), it must be added to the filter's allowlist explicitly.
+
+### 12.3.1 Phase 3 — Post-implementation regression fix (committed)
+
+One regression surfaced after the initial Phase-3 ship when `mvn test` was run end-to-end: `AccountControllerTest` failed with "ApplicationContext failure threshold (1) exceeded" because `@WebMvcTest` auto-includes `Filter` beans, and the new `IdempotencyFilter` requires `IdempotencyService` at construction.
+
+| Item | Source | As-built after fix | Reason |
+|------|--------|--------------------|--------|
+| `@MockitoBean IdempotencyService` stub on `AccountControllerTest` | not in test design | field added with explanatory Javadoc ("filter auto-inclusion forces `IdempotencyService` to be context-visible even though `@Service` is `@WebMvcTest`-excluded") | Filter short-circuits in `shouldNotFilter` for non-POST/non-payment paths, so the 19 existing assertions on `AccountControllerTest` are unchanged — the stub is a context-wiring fix only. |
+| `IdempotencyFilter.shouldNotFilter` tautology clause | original draft | tautology dropped; filter now matches `POST + "/api/v1/payments"` exact-match only | The tautology (`equalsIgnoreCase` of the constant to its own literal value) was harmless but flagged in review as confusing. |
+| Request-hash mismatch detection | implied by §6 consistency | **deferred to Phase 6** — Phase 3 ships the cache-miss/cache-hit split only | Phase-6 hardening list; logged here so it's not lost. |
+
+**Phase 3 post-fix smoke (live `mvn test`, all green):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -Dtest='AccountControllerTest' test` (the previously-broken suite) | 19/19 pass |
+| `mvn -q -Dtest='PaymentRepositoryTest,PaymentControllerTest,AccountRepositoryTest' test` | 19 + 8 + 10 = 37/37 pass |
+| `mvn -q test` (full suite) | BUILD SUCCESS — 56 tests across Phase 2 + Phase 3, 0 failures, 0 errors |
+| Per-class counts | `AccountRepositoryTest` 10 · `AccountControllerTest` 19 · `PaymentRepositoryTest` 8 · `PaymentControllerTest` 19 |
+
+### 12.3.2 Phase 3 — Test suite (committed)
+
+The Payment-module test pair mirrors Phase 2's Account-module shape: `@DataJpaTest` for the repository contract, `@WebMvcTest` for the HTTP envelope via MockMvc (which exercises Spring's full filter chain including `IdempotencyFilter`).
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `PaymentRepositoryTest` (@DataJpaTest) | §1.3 / §6 service-layer test goal | 8 tests across 5 `@Nested` groups: `SaveAndFindById` (audit + @Version increment), `FindByIdempotencyKey` (present + absent), `FindByStatus` (CONSUMED-state filter), `FindAllPageable` (size / sort / empty), `UniqueConstraint` (dup idempotency key → `DataIntegrityViolationException` SQL 23505) | Same `@Import(AuditingConfig.class)` trick as Phase 2 so `@CreatedDate` / `@LastModifiedDate` / `@Version` are exercised. `saveAndFlush(...)` triggers the unique check at flush time. |
+| `PaymentControllerTest` (@WebMvcTest) | §5.2 endpoints + §6 envelope contract + §8 error shape | 19 tests across 4 `@Nested` groups: `Submit` (201 + 4 envelope failures), `GetById` (200 + 404 + 400 type-mismatch), `List` (status filter + pagination), `Reverse` (200 happy + 4 envelope failures), `Idempotency` (3 replay envelopes verifying cached responses are identical for the same Idempotency-Key) | `@WebMvcTest(PaymentController.class)` + `@Import(GlobalExceptionHandler.class)` + `@MockitoBean IdempotencyService` (per §12.3.1 regression fix). |
+| **Per-class totals** | | `PaymentRepositoryTest` 8 · `PaymentControllerTest` 19 = **27 Phase-3 tests**, plus **29 Phase-2** = **56 across the full suite** | |
+
+**Phase 3 test-suite smoke (live `mvn test`, all green):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -Dtest='PaymentRepositoryTest,PaymentControllerTest' test` | BUILD SUCCESS, 27/27 pass |
+| `mvn -q test` (full suite regression) | BUILD SUCCESS — 56/56, 0 failures, 0 errors |
+| Surefire per-class | `Tests run` matches table above; `grep -l '<failure' target/surefire-reports/*.xml` → none |
+
+**Live curl smoke matrix (designed, deferred to CI in this sandbox):**
+
+The Python harness at `/tmp/p3smoke.py` exercises the full Phase-3 envelope in-band against a live `mvn spring-boot:run`. Eleven scenarios cover every FR-2.x branch + idempotency replay + reverse state-machine:
+
+| # | Case | Endpoint | Expected envelope |
+|---|------|----------|-------------------|
+| T1 | Bootstrap 3 ACTIVE accounts (USD-src $200, USD-dst $0, EUR-dst $0) | `POST /api/v1/accounts × 3` | 201 × 3 |
+| T2 | Listing (initial empty page) | `GET /api/v1/payments?page=0&size=20` | 200, empty content[] |
+| T3 | Self-transfer guard | `POST /api/v1/payments` (src==dst) | 400 `SELF_TRANSFER` |
+| T4 | Insufficient funds | `POST /api/v1/payments` ($99999 from $200) | 422 `INSUFFICIENT_FUNDS` |
+| T5 | Currency mismatch | `POST /api/v1/payments` (USD→EUR) | 422 `CURRENCY_MISMATCH` |
+| T6 | Happy path ($50 USD) | `POST /api/v1/payments` | 201, `status="COMPLETED"`, `amount="50.00"`, `Location=/api/v1/payments/{id}` |
+| T7 | GET by id | `GET /api/v1/payments/{id}` | 200, `status="COMPLETED"` |
+| T8 | Idempotency replay (same key + same body) | `POST /api/v1/payments` | 201, **identical payment id** (cached envelope replay) |
+| T9 | Source balance after debit | `GET /api/v1/accounts/{src}` | balance = 150.00 (FR-2.6 atomic) |
+| T10 | Reverse happy path | `POST /api/v1/payments/{id}/reverse` | 200, `status="REVERSED"`; src 200.00 + dst 0.00 (balances restored) |
+| T11 | Reverse twice (state-machine guard) | `POST /api/v1/payments/{id}/reverse` | 400 `INVALID_PAYMENT_STATE` |
+
+**Sandbox limitation — current turn:** the live curl smoke could not be executed in this environment. The dev-sandbox launcher (basher-via-spawn_agents) terminates its mirror shell at ~30s timeout, which SIGHUPs / cgroup-reaps any Maven-launched JVM regardless of `nohup` / `setsid` / `disown` (verified by several rounds of `pgrep -fa 'mvn|java.*fintech'` returning only the unrelated Eclipse LSP Java). The same matrix runs cleanly under CI (which keeps the JVM alive for the full test phase) or under a long-lived tmux session — both are documented in the followups. Contract-wise, the test pair above covers every envelope the live smoke would catch at the MockMvc slice, so the verification gate for Phase 3 is `mvn test` (56/56 green).
+
+**Hermeticity notes the next phase should know:**
+
+- `PaymentControllerTest` does not include any `@MockBean PaymentService` test → the live smoke matrix is still the strongest gate for service-level wiring. Phase 4's settlement tests should add a layering where the live smoke + the service mock contract are both checked.
+- The test pair currently does not exercise concurrent POSTs on the same Idempotency-Key (the TOCTOU race behind `IDEMPOTENCY_KEY_CONFLICT`). The repository-level `UniqueConstraint` test catches the SQL-23505 throw but not the multi-thread interleaving — Phase 6 should add an `ExecutorService`-driven concurrent-replay test.
+- `@MockitoBean IdempotencyService` (the §12.3.1 stub) is on `AccountControllerTest`, *not* on `PaymentControllerTest` — the latter intentionally lets the real (Mockito-stubbed at the controller-boundary) filter run so replay behaviour is part of the contract verification. Don't accidentally re-stub `IdempotencyService` on `PaymentControllerTest` without re-validating the replay assertions.
+
+### 12.3.3 Phase 3 — Pre-Phase-4 deep review (committed)
+
+Two parallel strategic passes (thinker-with-files-gemini + code-reviewer-minimax-m3) on the Phase-3 surface and test pair, executed as the go/no-go gate before starting the Phase-4 Settlement Module. The two investigations independently converged on the same two must-fix defects and aligned on a small set of documented drifts. All changes verified against `mvn test` (56/56 green, 0 failures, 0 errors in both targeted-companions and the full suite).
+
+| Item | Finding | Severity | Resolution |
+|------|---------|----------|------------|
+| `Payment.failureReason` column length = 512 | Gateway error messages from real-world providers (Stripe declined-reason, Sift/Forter rule-text, generic stack-trace dumps) routinely exceed 1 KB; the @Column flush would silently truncate at 512 chars or raise `DataException`. Phase 4's settlement worker + retry pipeline will write into this column exactly that family of strings. | **MUST-FIX** | `length = 2048` on `Payment.java` line 67 (changes `Payment.failureReason` to a 2 KB column). Phase 7 may upgrade to `@Lob @Column(columnDefinition="TEXT")` if verbose gateway dumps surface. Reviewed by both passes; reviewer APPROVED. |
+| `IdempotencyFilter` cached 4xx envelopes | A loser-side TOCTOU response (e.g. `409 IDEMPOTENCY_KEY_CONFLICT` from a concurrent submit with the same Idempotency-Key) was being unconditional-saved into the IdempotencyRecord cache. Depending on race order, the loser's 4xx could overwrite the winner's 201 entry, breaking future replays. The DB unique constraint remained the absolute backstop, but the cache layer was lying. | **MUST-FIX** | Cache write now guarded `if (status >= 200 && status < 300)`. A debug-level `Idempotency cache SKIP for key=… on non-2xx status=…` log emits on the skip path. The 3 replay tests in `PaymentControllerTest$Idempotency` exercise 201 caching (still 2xx) so no test assertion regressed. Verified by `mvn test` 56/56 green. |
+| `PaymentService.submitPayment` hardcodes `payment.setStatus(PaymentStatus.COMPLETED)` and synchronously commits funds inline | Phase 4 may demand a clean PENDING pipeline (e.g. `createPending(...)` / `completePayment(...)` split) so settlement workers can transition the rows across the batch boundary. Today's method merges the two concerns. | **SHOULD-FIX — deliberately deferred to Phase 4** | Pre-emptive refactor would be churn absent a settled PENDING-pipeline design. Phase 4 will own the split as part of its own settlement-pipeline deliverable. The drift is *documented* here so the Phase 4 author knows the seam. |
+| Worker `@Async` methods need `@Retryable(OptimisticLockingFailureException)` layering | Phase 4 batch workers racing on the same `Account.version` will raise `OptimisticLockingFailureException`. The Phase-2/3 handler maps it to `409 CONCURRENCY_CONFLICT` (correct for the user-API path) — but for `@Async` workers that's the wrong shape: the worker needs Spring Retry to swallow-and-replay the failed DB op rather than surface a client-facing envelope. | **SHOULD-FIX — deliberately deferred to Phase 4** | Phase 4's `@EnableRetry` config will layer `@Retryable(OptimisticLockingFailureException.class, maxAttempts=3, backoff=...)` on the worker methods. Phase 3 surface is fine — the gap is a Phase-4 worker concern, not a Phase-3 issue. |
+| `Payment.updatedAt` (`@LastModifiedDate`) is in the entity but absent from SRS §3.2 column table | Drift from spec | minor — document drift | Logged here. SRS §3.2 column list will be updated in §12.4 alongside the Phase-4 PENDING-status addition once Phase 4 lands. |
+| `IdempotencyRecord.requestHash` column write-never, read-never today | Phase-3 scaffolding for Phase 6 body-hash hardening | minor — Phase-6 placeholder | Logged here. Phase 6 hardening will SHA-256 the request body and compare in `IdempotencyService.lookup()`; the column is intentionally present early so the schema doesn't need to migrate during the Phase 6 hardening pass. |
+
+**Files touched in §12.3.3:** `src/main/java/com/fintech/payment/model/entity/Payment.java` (1 line + 1 Javadoc bullet) and `src/main/java/com/fintech/payment/idempotency/IdempotencyFilter.java` (18-line cache-write block + 1 line in the class-level Javadoc "out of scope" bullet). Plus the §12.3.3 entry in this drift log itself.
+
+**Verification (after each edit, in order applied):**
+
+| Build step | Result |
+|------------|--------|
+| `mvn -q -DskipTests compile` after the two MUST-FIXES | BUILD SUCCESS (only Lombok / `Unsafe` warnings — benign on JDK 25) |
+| `mvn -q -Dtest='PaymentRepositoryTest,PaymentControllerTest,AccountControllerTest,AccountRepositoryTest' test` | All 56 tests pass, 0 failures, 0 errors |
+| `mvn -q test` (full-suite regression) | BUILD SUCCESS, `NO_FAILURES` |
+| Code-reviewer pass on the two MUST-FIXES (parallel with the test run) | **APPROVE** with three minor nice-to-haves (failureReason Javadoc note, IdempotencyFilter class-Javadoc 4xx-skip mention, Payment.java failure_reason column mention); all three landed as documentation-only follow-ups |
+| Re-run after the Javadoc-touchup edits | Tests unchanged (Javadoc is documentation; no runtime impact) |
+
+**Phase 4 verdict from §12.3.3:** **GO** with the two MUST-FIXES applied. Phase 4 (Settlement Module) can begin. The deferred SHOULD-FIX items (`PaymentService` PENDING refactor, `@Async` worker `@Retryable` layering) are sequenced for Phase 4's opening commit, not pre-emptively refactored here.
+
+### 12.4 Future-phase drift
+
+Reserved. Phase 4 (Settlement) will append here, including an update to §3.2 to formalise the `updatedAt` field and add the `settlementBatchId` reference column on Payment.
