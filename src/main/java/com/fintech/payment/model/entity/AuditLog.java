@@ -11,10 +11,9 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
-import lombok.AllArgsConstructor;
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
-import lombok.Setter;
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
@@ -22,23 +21,37 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * AuditLog entity — SRS §3.5.
+ * AuditLog entity — SRS §3.5 (Phase 6 immutability-hardening).
  *
- * <p>Append-only invariant (Phase-1 §12.2, FR-4.1): no {@code @Version},
- * no {@code @LastModifiedDate}, no setter mutation API outside Spring Data
- * proxies. The entity deliberately carries a Lombok {@code @Setter} from
- * Phase-3-3 Lombok defaults for repository construction; <strong>production
- * code never calls a setter on an {@code AuditLog}</strong> after the row
- * is persisted (the audit-immutability NFR is enforced by convention).
- * A future hardening pass may drop {@code @Setter} on {@code createdAt}
- * to make this idiomatic; documented as a Phase-6 polish item.</p>
+ * <h2>Immutability invariant (Phase 6 §12.6.1)</h2>
  *
- * <p>Indexing:</p>
+ * <p>The append-only invariant (Phase-1 §12.2, FR-4.1) is now
+ * <em>machine-checkable</em>, not merely conventional:</p>
+ * <ul>
+ *   <li>No {@code @Setter} — production code cannot mutate fields after
+ *       construction (the canonical FR-4.1 enforcement).</li>
+ *   <li>No {@code @AllArgsConstructor} — prevents Lombok from synthesising
+ *       a public constructor that would allow re-creation with mutated
+ *       fields.</li>
+ *   <li>{@code @NoArgsConstructor(access = AccessLevel.PROTECTED)} — JPA
+ *       requires a no-args constructor for proxy hydration (Hibernate
+ *       field-access default holds because {@code @Id} is on the field).
+ *       Visibility is {@code PROTECTED} so application code cannot call
+ *       it; only Hibernate's reflection-based instantiator can.</li>
+ *   <li>Targeted public constructor for the 6 mutable columns — single
+ *       canonical construction path, easy to audit.</li>
+ * </ul>
+ *
+ * <p>After a row is persisted, the entity cannot be mutated through any
+ * application-level API. Hibernate's managed-flush lifecycle may write to
+ * the {@code @Version}-less row (intentionally; we use field-access
+ * defaults, no dirty-checking triggers on managed instances since
+ * writes go through {@code save()} exclusively).</p>
+ *
+ * <h2>Indexing</h2>
  * <ul>
  *   <li>{@code ix_audit_logs_entity} on {@code (entity_type, entity_id)} —
- *       primary FR-4.2 query path;
- *       {@code repository.findByEntityTypeAndEntityIdOrderByCreatedAtDesc}
- *       is the dominant read pattern.</li>
+ *       primary FR-4.2 query path.</li>
  *   <li>{@code ix_audit_logs_created_at_desc} on {@code created_at DESC} —
  *       chronological list and reconciliation window queries.</li>
  * </ul>
@@ -58,9 +71,7 @@ import java.util.UUID;
         })
 @EntityListeners(AuditingEntityListener.class)
 @Getter
-@Setter
-@NoArgsConstructor
-@AllArgsConstructor
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class AuditLog {
 
     @Id
@@ -80,18 +91,17 @@ public class AuditLog {
 
     /**
      * Previous state as a JSON string. Nullable on CREATED (no prior
-     * state); populated on STATUS_CHANGE / REVERSED for the most common
-     * observed transitions. Stored as TEXT so arbitrary shapes are allowed.
-     * Phase 6 may enforce a serializer-side validation schema.
+     * state); populated on STATUS_CHANGE / REVERSED via the Phase-6
+     * SpEL wiring on {@link com.fintech.payment.audit.Audited}. Stored
+     * as TEXT so arbitrary shapes are allowed.
      */
     @Column(name = "old_value", columnDefinition = "TEXT", updatable = false)
     private String oldValue;
 
     /**
-     * New state as a JSON string. Nullable only when an {@code @Audited}
-     * method emits audit without a captured new state (Phase 5 ships no
-     * such case; left nullable so future fields don't require a schema
-     * change).
+     * New state as a JSON string. Source: Phase-6 SpEL
+     * {@code newValueSpel} expression on {@code @Audited} (defaults to
+     * empty, which audits writes null per AuditAspect KISS).
      */
     @Column(name = "new_value", columnDefinition = "TEXT", updatable = false)
     private String newValue;
@@ -108,4 +118,23 @@ public class AuditLog {
     @CreatedDate
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
+
+    /**
+     * Targeted constructor — the single application-level construction
+     * path. {@code id} and {@code createdAt} are populated by Hibernate
+     * (UUID generation strategy + {@code @CreatedDate} auditing listener).
+     */
+    public AuditLog(String entityType,
+                    UUID entityId,
+                    AuditAction action,
+                    String oldValue,
+                    String newValue,
+                    String performedBy) {
+        this.entityType = entityType;
+        this.entityId = entityId;
+        this.action = action;
+        this.oldValue = oldValue;
+        this.newValue = newValue;
+        this.performedBy = performedBy;
+    }
 }

@@ -218,9 +218,12 @@ class PaymentRepositoryTest {
 
         @Test
         void save_and_findById_returns_record() {
+            // Phase 6 constructor — adds bodyHash (SHA-256 hex of request body);
+            // the value below is a fixed test fixture, not a real SHA-256.
             IdempotencyRecord record = new IdempotencyRecord(
                     "IDEM-CRUD-1", 201,
                     "{\"data\":{\"id\":\"x\"},\"timestamp\":\"2026-07-02T10:30:00Z\"}",
+                    "test-hash-001",
                     Instant.now());
             idempotencyRepository.saveAndFlush(record);
 
@@ -228,15 +231,16 @@ class PaymentRepositoryTest {
             assertThat(loaded).isPresent().get().satisfies(r -> {
                 assertThat(r.getResponseStatus()).isEqualTo(201);
                 assertThat(r.getResponseBody()).contains("\"id\":\"x\"");
+                assertThat(r.getBodyHash()).isEqualTo("test-hash-001");
             });
         }
 
         @Test
         void overwriting_existing_record_replaces_status_and_body() {
             idempotencyRepository.saveAndFlush(new IdempotencyRecord(
-                    "IDEM-CRUD-2", 422, "first", Instant.now()));
+                    "IDEM-CRUD-2", 422, "first", "test-hash-002a", Instant.now()));
             idempotencyRepository.saveAndFlush(new IdempotencyRecord(
-                    "IDEM-CRUD-2", 422, "second", Instant.now()));
+                    "IDEM-CRUD-2", 422, "second", "test-hash-002b", Instant.now()));
             assertThat(idempotencyRepository.findById("IDEM-CRUD-2").get().getResponseBody())
                     .isEqualTo("second");
         }

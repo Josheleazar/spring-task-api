@@ -65,7 +65,13 @@ public class AuditService {
      * <p>Both {@code oldValue} and {@code newValue} are nullable — pass
      * {@code null} for the canonical CREATED record (no prior state) and
      * for any future {@code @Audited} annotation that produces audit
-     * rows without snapshotting entity state (Phase 5 ships none).</p>
+     * rows without snapshotting entity state (Phase 5 KISS default).</p>
+     *
+     * <p>Phase-6 immutability: the constructor-only API on
+     * {@link AuditLog} (no setters, no AllArgsConstructor) is exercised here.
+     * Production code cannot mutate a constructed {@code AuditLog} after
+     * this method returns — the FR-4.1 append-only invariant is enforced
+     * by the type system, not by convention.</p>
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public UUID record(AuditAction action,
@@ -74,14 +80,14 @@ public class AuditService {
                        String oldValue,
                        String newValue,
                        String performedBy) {
-        AuditLog log = new AuditLog();
-        log.setEntityType(entityType);
-        log.setEntityId(entityId);
-        log.setAction(action);
-        log.setOldValue(oldValue);
-        log.setNewValue(newValue);
-        log.setPerformedBy(performedBy == null ? DEFAULT_PERFORMED_BY : performedBy);
-        AuditLog saved = auditLogRepository.save(log);
+        AuditLog row = new AuditLog(
+                entityType,
+                entityId,
+                action,
+                oldValue,
+                newValue,
+                performedBy == null ? DEFAULT_PERFORMED_BY : performedBy);
+        AuditLog saved = auditLogRepository.save(row);
         return saved.getId();
     }
 

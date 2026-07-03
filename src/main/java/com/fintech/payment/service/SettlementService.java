@@ -18,6 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * Phase 4 settlement service — covers FR-3.1, FR-3.5 + the
@@ -55,10 +56,32 @@ public class SettlementService {
      * if none exists. Idempotent — a second invocation hits the unique
      * constraint on {@code batch_date} and is silently tolerated (logged at
      * INFO; the day already has a batch).
+     *
+     * <p>Phase 6 §12.6.1 item (1): the worker dispatch is wrapped in a
+     * try/catch on {@link RejectedExecutionException} so a queue overflow
+     * on the {@code settlementWorkerExecutor} (core=2 / max=4 / queue=50
+     * per {@code AsyncConfig}) does not leave a freshly-persisted OPEN
+     * batch row stranded without an eventual worker attempt. The handler
+     * emits a {@link AuditAction#BATCH_REJECTED} audit row so operations
+     * can detect stranded batches via the {@code /api/v1/audit?entityType=SETTLEMENT_BATCH}
+     * endpoint and trigger a manual {@code POST /process} to recover.</p>
+     *
+     * <p>The method is explicitly {@code @Transactional} (read-write) to
+     * escape the class-level {@code readOnly=true} inheritance — the
+     * persisted batch row + audit inserts are writes and would otherwise
+     * be quietly hinted-as-readonly against stricter Hibernate flush
+     * policies. The Phase-6 reviewer flagged this as a forward-flag.</p>
+     *
+     * <p>The {@code DataIntegrityViolationException} catch (unique-constraint
+     * race) is preserved at the same level — both rejection paths are
+     * distinguishable in the audit log via distinct {@code action} values.</p>
      */
+    @Transactional
     @Scheduled(cron = "0 0 0 * * *")
     public void createDailyBatch() {
         LocalDate today = LocalDate.now(clock);
+        SettlementBatch saved = null;
+        boolean createSucceeded = false;
         try {
             SettlementBatch batch = new SettlementBatch();
             batch.setBatchDate(today);
@@ -66,15 +89,14 @@ public class SettlementService {
             batch.setTotalPayments(0);
             batch.setTotalAmount(java.math.BigDecimal.ZERO);
             batch.setCurrency("USD");  // FR-3.1 KISS — one batch per day, USD-aggregate only
-            SettlementBatch saved = settlementRepository.save(batch);
+            saved = settlementRepository.save(batch);
+            createSucceeded = true;
             log.info("Created settlement batch id={} for {}", saved.getId(), today);
             // Phase 5: emit the BATCH_OPEN audit row programmatically. The
             // @Audited annotation is argument-driven (entityIdArg = "batchId")
-            // and would not fit a no-arg @Scheduled tick; the alternative
-            // shape (post-proceed return-value resolution on the @Scheduled
-            // method) is documented in §12.5 as a Phase-6 hardening path.
-            // AuditService.record() runs in REQUIRES_NEW so the audit row
-            // commits independently of the daily-tick's persistence.
+            // and would not fit a no-arg @Scheduled tick. AuditService.record()
+            // runs in REQUIRES_NEW so the audit row commits independently of
+            // the daily-tick's persistence.
             auditService.record(
                     AuditAction.BATCH_OPEN,
                     "SETTLEMENT_BATCH",
@@ -86,6 +108,28 @@ public class SettlementService {
             settlementWorker.processBatchAsync(saved.getId());
         } catch (DataIntegrityViolationException ex) {
             log.info("Settlement batch for {} already exists (race or duplicate tick) — skipped", today);
+        } catch (RejectedExecutionException ex) {
+            // §12.6.1 item (1): worker pool rejection. The batch row IS persisted
+            // at this point (createSucceeded==true) but the worker was rejected.
+            // Emit BATCH_REJECTED so operators see the gap; do NOT roll back
+            // the batch row — the row's existence is the truth, the @Async
+            // submission is best-effort. An operator can recover via
+            // POST /api/v1/settlements/{id}/process (manual trigger).
+            if (createSucceeded && saved != null) {
+                log.warn("Worker rejected dispatch for batchId={} date={}: {} — batch row remains OPEN; " +
+                        "audit row BATCH_REJECTED emitted for ops visibility",
+                        saved.getId(), today, ex.toString());
+                auditService.record(
+                        AuditAction.BATCH_REJECTED,
+                        "SETTLEMENT_BATCH",
+                        saved.getId(),
+                        null,
+                        ex.toString(),
+                        "system");
+            } else {
+                log.warn("Worker rejection before batch row persisted (date={}): {}",
+                        today, ex.toString());
+            }
         }
     }
 

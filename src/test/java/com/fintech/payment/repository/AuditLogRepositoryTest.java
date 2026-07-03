@@ -56,14 +56,14 @@ class AuditLogRepositoryTest {
     private static final String ENTITY_BATCH = "SETTLEMENT_BATCH";
 
     private AuditLog audit(UUID entityId, String entityType, AuditAction action) {
-        AuditLog log = new AuditLog();
-        log.setEntityType(entityType);
-        log.setEntityId(entityId);
-        log.setAction(action);
-        log.setOldValue(null);
-        log.setNewValue(null);
-        log.setPerformedBy("system");
-        return log;
+        // Phase-6 immutability: constructor-only API (the @Setter pattern
+        // was dismantled by item 2 — see AuditLog class-level Javadoc).
+        return new AuditLog(entityType, entityId, action, null, null, "system");
+    }
+
+    private AuditLog audit(UUID entityId, String entityType, AuditAction action,
+                           String oldValue, String newValue) {
+        return new AuditLog(entityType, entityId, action, oldValue, newValue, "system");
     }
 
     @Nested

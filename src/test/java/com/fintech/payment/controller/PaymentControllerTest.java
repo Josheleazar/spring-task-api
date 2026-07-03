@@ -80,13 +80,14 @@ class PaymentControllerTest {
     /* -------------------- IdempotencyFilter precondition -------------------- */
 
     /**
-     * The {@link IdempotencyFilter} uses {@link IdempotencyService#lookup(String)}
+     * The {@link IdempotencyFilter} uses
+     * {@link IdempotencyService#lookup(String, byte[])} (Phase 6 SHA-256 body-hash)
      * to gate replays. We stub lookup to return {@link Optional#empty()} across
      * every test so the controller path executes normally. Save is a no-op since
      * the upstream {@code @MockitoBean} returns {@code void} by default.
      */
     private void stubIdempotencyMissForAnyKey() {
-        when(idempotencyService.lookup(any())).thenAnswer((InvocationOnMock inv) -> Optional.empty());
+        when(idempotencyService.lookup(any(), any())).thenAnswer((InvocationOnMock inv) -> Optional.empty());
     }
 
     /* -------------------- helpers -------------------- */

@@ -47,11 +47,36 @@ import java.lang.annotation.Target;
  *   <li>{@link #action()} — the {@link AuditAction} enum value.</li>
  * </ol>
  *
- * <p>{@code oldValueJson} / {@code newValueJson} are intentionally NOT
- * declared on the annotation: Phase-5 KISS leaves both columns nullable
- * and writes them as {@code null}. A future hardening pass could add
- * SpEL expressions here ({@code "#result.status"} on a return value,
- * for example) without breaking today's call sites.</p>
+ * <h2>Phase-6 SpEL slots</h2>
+ *
+ * <p>{@link #oldValueSpel()} and {@link #newValueSpel()} carry optional
+ * SpEL expressions that the {@code AuditAspect} evaluates against the
+ * method arguments + return value, then serializes to JSON via the
+ * autowired Spring {@code ObjectMapper}. Defaults to empty strings; an
+ * empty expression causes the aspect to write {@code null} for that
+ * column (Phase-5 KISS backward-compat). When populated, they support
+ * audit snapshots such as:</p>
+ *
+ * <pre>{@code
+ * @Audited(
+ *     entityType = "PAYMENT",
+ *     action = REVERSED,
+ *     entityIdArg = "id",
+ *     oldValueSpel = "#result.status.name()",
+ *     newValueSpel = "'REVERSED'")
+ * public PaymentResponse reversePayment(UUID id, String reason) { ... }
+ * }</pre>
+ *
+ * <p>SpEL evaluation variables:</p>
+ * <ul>
+ *   <li>{@code #p0}, {@code #p1}, ... — positional method arguments
+ *       (Spring's {@code StandardEvaluationContext} convention).</li>
+ *   <li>Named argument variables (e.g. {@code #id}, {@code #reason}) —
+ *       derived from Spring's {@code ParameterNameDiscoverer}.</li>
+ *   <li>{@code #result} — the host method's return value (the saved
+ *       DTO / entity — Jackson serializes it; prefer DTOs over managed
+ *       entities to avoid circular-reference faults).</li>
+ * </ul>
  *
  * <p>{@code performedBy} defaults to {@code "system"} because no auth
  * layer exists yet (Phase-8 production roadmap §10.2 — OAuth2/JWT
@@ -97,4 +122,20 @@ public @interface Audited {
      * Actor identity. Defaults to {@code "system"}.
      */
     String performedBy() default "system";
+
+    /**
+     * Optional SpEL expression evaluated against the method-arg context
+     * ({@code #p0}, named vars) and serialized to JSON. Empty = no
+     * snapshot (writes {@code null}). Errors are swallowed (logged at
+     * WARN) and never propagate.
+     */
+    String oldValueSpel() default "";
+
+    /**
+     * Optional SpEL expression evaluated against the method-arg context
+     * AND the {@code #result} variable (post-proceed return value),
+     * serialized to JSON. Empty = no snapshot (writes {@code null}).
+     * Errors are swallowed.
+     */
+    String newValueSpel() default "";
 }
