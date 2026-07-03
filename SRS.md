@@ -1124,3 +1124,36 @@ Phase-7 §12.6.1/§12.6.2 ITs surfaced two **pre-existing production defects** i
 
 **Forward-flag (Phase 7.x):** The two production-code defects above should be scheduled for a follow-up Phase-7.x sweep — they are NOT resolved by deferral; deferral only stops the test noise. Estimated scope: ~30-50 LoC across `IdempotencyService` (commit-time exception rethrow) and `IdempotencyFilter` (HandlerExceptionResolver injection or local envelope conversion). No new dependencies required.
 
+
+### 12.7.1.1 Phase 7.x — Group 3 re-enable attempts (deferred)
+
+Phase-7.x attempted two further mechanisms to unblock the three Group-3 `@Disabled` tests in `ReconciliationReportServiceTest`. Both attempts were abandoned at the same root symptom: the `@CreatedDate` field on `AuditLog` never carries the staged `java.time.Instant` value during `saveAndFlush`, so seeded rows land with `Clock.systemUTC()` defaults and the window-edge assertions fail with `AssertionFailedError: expected X but was 0L`.
+
+**Attempt v1 (Phase 7.x first iteration, `@MockitoBean DateTimeProvider` + `@SpringBootTest`):** Hypothesis: a MockitoBean-replaced DateTimeProvider would propagate to AuditingHandler once the test slice is `@SpringBootTest` (heavier than `@DataJpaTest` slice). Result: same `expected X but was 0L`. The MockitoBean replacement is registered AFTER AuditingHandler captures its DateTimeProvider reference; rows fall back to `Clock.systemUTC().instant()`. Outcome: ABANDONED.
+
+**Attempt v2 (Phase 7.x second iteration, explicit `@TestConfiguration @Primary DateTimeProvider` bean with `AtomicReference` backing):** Hypothesis: a directly-defined bean (not a Mockito mock) with mutable backing would be reliably read by AuditingHandler. Result: same `expected X but was 0L`. Either (a) `@Primary` does not override the `JpaAuditingConfiguration` internal `CurrentDateTimeProvider` wiring, OR (b) AuditingHandler captures the bean reference at construction time and subsequent re-registration is too late, OR (c) `@EnableJpaAuditing`'s auto-config registers `CurrentDateTimeProvider` unconditionally and our `@Primary` bean is not picked up by AuditingHandler's dependency lookup. Outcome: ABANDONED after 2 attempts; reverted to `@Disabled` state.
+
+**Net Phase 7.x Group-3 outcome:** Items 1 + 2 of the Phase 7.x minimum scope — the production-code fixes in `IdempotencyService.save()` and `IdempotencyFilter` per SRS §12.7.2 forward-flag — SUCCEEDED (loop running, no compile errors, full-regression suite unblocked). Items 3 + 4 (Group 3 test re-enable) REVERTED: tests return to `@Disabled` state. No net improvement on the SRS §12.7.1 forward-flag.
+
+**Phase 7.x.2 forward-flag (deeper Spring Data auditing investigation):**
+- Register `JpaAuditingHandler` bean explicitly with our `@Primary DateTimeProvider` as a constructor argument, bypassing autowiring.
+- Switch `AuditLog.createdAt` from Spring Data's `@CreatedDate` (auditing-via-DateTimeProvider) to Hibernate's `@CreationTimestamp` (auditing-via-Hibernate-event-listener), bypassing Spring Data wiring entirely. Trades the listening wiring problem for a Hibernate-only mechanism.
+- Inspect `JpaAuditingConfiguration` source to confirm whether `CurrentDateTimeProvider` is registered unconditionally or `@ConditionalOnMissingBean`, and what triggers AuditingHandler's DateTimeProvider dependency lookup.
+- Possibly: investigate whether the legacy `@DataJpaTest` slice shape can be revived for the 3 tests as an alternative test envelope (different JPA semantics, possibly different listener wiring).
+
+Scope: ~30-60 LoC test config + (optionally) ~10-20 LoC entity annotation swap. Phase 7.x.2 needs a dedicated diagnostic pass.
+
+
+### 12.6.4 Phase 7.x — SettlementWorkerIT YELLOW closure (committed)
+
+Phase-7.x closes the §12.6 forward-flag for the `SettlementWorkerIT.RetryChain` test. The Phase-6 surface shipped the test in `YELLOW` status (`ConditionTimeout` on `verify(times(2)).processBatchTransactional(...)`). Working theory at Phase-6 close-out was that the `@Async` dispatch never materialised a worker thread before Awaitility polled. Phase-7's partial attempt then layered `Thread.sleep(1500)` ramp + Awaitility `atMost(10s).pollInterval(250ms)`, but this was still timer-driven and racy under load.
+
+**Phase-7.x fix:** replaced timer-driven synchronisation with **event-driven `CountDownLatch(2)` countdown**. The MockitoBean mock is the SAME bean instance in the application context regardless of caller thread, so Mockito's `doAnswer` callback runs on the worker thread when invoked by `processBatchTransactional`. The callback decrements the latch exactly once per invocation (whether throw or success). The test thread blocks on `attemptsFired.await(10, TimeUnit.SECONDS)` and asserts via AssertJ on the boolean return — a clear failure mode (`firedTwice == false`) instead of Awaitility's opaque `ConditionTimeoutException`.
+
+**Trimmed (alongside):** dropped the orphaned `@SpringBootTest(properties = "spring.task.execution.pool.*")` block — those properties only configure Spring's DEFAULT `TaskExecutor`, NOT the named `settlementWorkerExecutor` bean (hardcoded `core=2`, `max=4`, `queue=50` in `AsyncConfig.java`). The Phase-7 attempt's pool-sizing props were therefore inert against the `@Async("settlementWorkerExecutor")` target. The two retained properties (`logging.level.*`) are still useful for CI triaging.
+
+**Net Phase-7.x work-item LoC change:** ~20 LoC in `SettlementWorkerIT.java` (drop Awaitility import + Thread.sleep preamble + dead pool-sizing properties; add `CountDownLatch` countdown in `doAnswer` + `latch.await(10s)` block). Zero production-code changes; settlementWorkerExecutor and `@Async` + `@Retryable` wiring in `AsyncConfig.java` + `SettlementWorker.java` are unchanged.
+
+**Failure-mode contract change:** `ConditionTimeoutException` (old) → AssertJ `.as("both @Retryable attempts decremented the latch within 5s budget")` (new). CI dashboard grep patterns that look for `ConditionTimeout` in `SettlementWorkerIT.RetryChain` should be updated to match the **literal `.as(...)` clause string** — that string is the printed-locator AssertJ emits on failure and is the stable, code-pinned grep handle going forward. A `firedTwice` Mockito-side counter does NOT surface in the AssertJ failure output, so the `.as(...)` text is the only stable contract line.
+
+

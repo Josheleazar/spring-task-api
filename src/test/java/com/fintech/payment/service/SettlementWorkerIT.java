@@ -2,7 +2,6 @@ package com.fintech.payment.service;
 
 import com.fintech.payment.repository.PaymentRepository;
 import com.fintech.payment.repository.SettlementRepository;
-import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -14,8 +13,9 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
-import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,16 +28,29 @@ import static org.mockito.Mockito.verify;
  * Phase 6 — Integration Test for the SettlementWorker
  * {@code @Async + @Retryable} chain (§12.6.1 item 6).
  *
- * <p>Hermeticity note (§12.4.2): Spring Boot's full test harness is needed
- * because the {@code @EnableAsync} and {@code @EnableRetry} proxies are
- * only active in the production ApplicationContext. {@code @WebMvcTest} or
- * plain {@code @DataJpaTest} would not exercise the retry / async layer.</p>
+ * <p>Closes the SRS §12.6 forward-flag: the previous YELLOW state
+ * ("ConditionTimeout on {@code verify(times(2))}") was rooted in a
+ * timer-driven test ({@code Thread.sleep} ramp + Awaitility
+ * {@code atMost(10s).pollInterval(250ms)}), which is racy on a busy
+ * CI runner because the {@code @Async} dispatch plus the
+ * {@code @Backoff(500ms)} retry budget is timing-dependent. Phase 7.x
+ * converts the synchronization to event-driven: a {@link CountDownLatch}
+ * is decremented on each {@code processBatchTransactional} invocation
+ * (success or throw) on the worker thread, regardless of timing, and
+ * the test thread blocks on {@code latch.await(10, TimeUnit.SECONDS)}
+ * with AssertJ asserting the boolean return.</p>
+ *
+ * <p>Hermeticity note (§12.4.2): Spring Boot's full test harness is
+ * needed because the {@code @EnableAsync} and {@code @EnableRetry}
+ * proxies are only active in the production ApplicationContext.
+ * {@code @WebMvcTest} or plain {@code @DataJpaTest} would not exercise
+ * the retry / async layer.</p>
  *
  * <p>Strategy:</p>
  * <ol>
- *   <li>Use {@code @SpringBootTest} with a trimmed scan to focus on
- *       SettlementWorker + SettlementTransactionalService + the @Async
- *       {@code settlementWorkerExecutor}.</li>
+ *   <li>Use {@code @SpringBootTest} scoped to the SettlementWorker +
+ *       SettlementTransactionalService + the {@code @Async}
+ *       {@code settlementWorkerExecutor} chain.</li>
  *   <li>Stub {@link SettlementTransactionalService} via MockitoBean to
  *       throw {@link OptimisticLockingFailureException} on its first
  *       invocation, succeed on the second.</li>
@@ -45,33 +58,53 @@ import static org.mockito.Mockito.verify;
  *       test thread (Spring routes the execution onto the
  *       {@code settlementWorkerExecutor} thread pool because of the
  *       {@code @Async} annotation).</li>
- *   <li>Await on {@code awaitility} until the retry budget is consumed —
- *       assert {@code processBatchTransactional} was called twice (once
- *       throwing, once succeeding) and {@code markBatchFailed} was NOT
- *       called (we proved the chain converged via success).</li>
+ *   <li>Wait for the {@link CountDownLatch} to reach zero (one
+ *       decrement per {@code @Retryable} attempt, fired from inside the
+ *       {@code doAnswer} callback on the worker thread). Assert + verify
+ *       the final state.</li>
  * </ol>
- */
-/**
- * Phase 7 §12.6.1 closure — the @SpringBootTest launcher now explicitly
- * wires the executor pool to ensure the @Async dispatch fires
- * promptly. The previous Phase-6 surface shipped with this test in
- * {@code YELLOW} status (ConditionTimeout on
- * {@code verify(times(2))}). Root cause was undetermined at Phase-6
- * close-out but the working theory was: the implicit default executor
- * was queue-bound by an inherited 0/0 pool-size property (Production
- * profile's trick bled into dev profile tests), so the @Async dispatch
- * never materialised a worker thread on the @Retryable boundary before
- * the Awaitility poll exhausted. Phase-7 hardening explicitly sets a
- * pool size {@code >=2}, drops {@code @DirtiesContext} (which was
- * re-spinning the whole context between the only test method call),
- * and uses a {@code Thread.sleep(1500)} block BEFORE the Awaitility
- * poll as a deterministic entry-ramp so the async dispatch reliably
- * punches through before polling begins.
+ *
+ * <h2>Why not drive synchronisation off timing</h2>
+ * <ul>
+ *   <li>{@code Thread.sleep(1500)} pre-Awaitility ramp — racy in
+ *       CI/BusyBox contexts; the dispatch + retry budget is variable
+ *       under load.</li>
+ *   <li>{@code Awaitility.await().atMost(10s).pollInterval(250ms)} —
+ *       poll-based; a fast retry budget can clear in &lt;100ms and a
+ *       slow one can stretch past 1s; the poll may starve the worker
+ *       thread on a contended runner.</li>
+ *   <li>Both depend on {@code @Backoff(500)} being strictly observed;
+ *       if Spring Retry's first invocation fires fast (no backoff yet),
+ *       the Thread.sleep ramp can be 4× too long and Awaitility never
+ *       notices the gap.</li>
+ * </ul>
+ *
+ * <h2>Why {@link CountDownLatch} works</h2>
+ * <ul>
+ *   <li>The {@link SettlementTransactionalService} MockitoBean mock is
+ *       the SAME bean instance in the application context, regardless
+ *       of which thread (test thread vs {@code settlement-worker-N}
+ *       worker thread) reads it. Mockito's {@code doAnswer} callback
+ *       runs on the worker thread when invoked by
+ *       {@code processBatchTransactional}. The latch is decremented
+ *       exactly once per invocation, so a 2-attempt retry budget
+ *       decrements the latch from 2 → 0 and {@code latch.await(...)}
+ *       unblocks once both attempts have run.</li>
+ *   <li>Bounded time budget (10s) protects against a divergent retry
+ *       loop. If {@code latch.await} returns {@code false}, the
+ *       assertion surfaces a clear "firedTwice == false" failure
+ *       rather than Awaitility's opaque
+ *       {@code ConditionTimeoutException}.</li>
+ * </ul>
  */
 @SpringBootTest(properties = {
-        "spring.task.execution.pool.core-size=2",
-        "spring.task.execution.pool.max-size=4",
-        "spring.task.execution.pool.queue-capacity=10",
+        // The previously-set "spring.task.execution.pool.*" properties were
+        // DEAD on this path — they only configure Spring's DEFAULT
+        // TaskExecutor, NOT the named "settlementWorkerExecutor" bean
+        // (hardcoded core=2, max=4, queue=50 in AsyncConfig.java). Trimmed
+        // in Phase 7.x as part of the YELLOW closure. The two retained
+        // properties raise log level for the @Async + @Retry interceptor
+        // chains so CI failures here are diagnosable from logs.
         "logging.level.com.fintech.payment.service.SettlementWorker=DEBUG",
         "logging.level.org.springframework.aop.interceptor=DEBUG"
 })
@@ -105,65 +138,65 @@ class SettlementWorkerIT {
     class RetryChain {
 
         @Test
-        void throws_once_then_succeeds_retries_once_and_marks_settled() {
+        void throws_once_then_succeeds_retries_once_and_marks_settled() throws InterruptedException {
             // Seed an OPEN batch so the transaction actually opens.
             UUID batchId = seedOpenBatch();
 
+            // Event-driven countdown: the doAnswer callback decrements the
+            // latch on each invocation, regardless of whether the invocation
+            // throws or succeeds. After both @Retryable attempts (one throw,
+            // one success), the latch reaches 0 and latch.await(...) unblocks.
+            CountDownLatch attemptsFired = new CountDownLatch(2);
             AtomicInteger calls = new AtomicInteger();
             doAnswer((InvocationOnMock inv) -> {
                 int n = calls.incrementAndGet();
                 if (n == 1) {
                     // Throw on first attempt — the @Retryable boundary
-                    // catches OptimisticLockingFailureException and retries.
+                    // catches OptimisticLockingFailureException and schedules
+                    // a @Backoff(500) retry. Decrement BEFORE the throw so
+                    // latch.await catches the attempt regardless of throw.
+                    attemptsFired.countDown();
                     throw new OptimisticLockingFailureException(
                             "simulated CAS race on attempt " + n);
                 }
                 // Second attempt: succeed (no exception crosses the boundary).
+                attemptsFired.countDown();
                 return null;
             }).when(transactionalServiceMock).processBatchTransactional(any(UUID.class));
 
             // Dispatch via the bean reference — @Async routes onto the worker pool.
             settlementWorker.processBatchAsync(batchId);
 
-            // Phase 7 §12.6.1 closure: deterministic entry-ramp BEFORE
-            // Awaitility polling. Thread.sleep(1500) gives the @Async
-            // executor time to materialise a worker thread, hand off the
-            // call, fire the first @Retryable attempt, see the OLF
-            // exception, schedule the @Backoff(500) retry, and re-enter.
-            // Without this block, the Awaitility poll may begin before
-            // the dispatch has even cleared the caller-stack frame, and
-            // the 250 ms pollInterval can starve the worker thread on a
-            // contended CI runner.
-            // InterruptedException handling: re-set the interrupt flag
-            // after the catch so the surrounding test harness can
-            // observe the cancellation if it happens mid-await.
-            try {
-                Thread.sleep(1500);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("SettlementWorkerIT RetryChain pre-Awaitility sleep interrupted", ie);
-            }
+            // Bounded event-driven wait. The @Backoff(500ms) retry budget
+            // for 2 attempts is ~510ms of @Async dispatch latency; the 5s
+            // ceiling is tight enough to surface divergent retry behavior
+            // (e.g., 8s+ retry sleep slipping in later) on a single CI
+            // cycle while still allowing generous scheduler tolerance.
+            // AssertJ on the boolean surfaces a clean failure mode if the
+            // latch didn't reach zero in time.
+            boolean firedTwice = attemptsFired.await(5, TimeUnit.SECONDS);
+            assertThat(firedTwice)
+                    .as("both @Retryable attempts decremented the latch within 5s budget")
+                    .isTrue();
 
-            // Await until both attempts have fired. Spring Retry backoff is
-            // 500ms per @Backoff(delay=500); we already pre-empted the
-            // entry-ramp with Thread.sleep, so the remaining budget for
-            // completing the second attempt is well within 10s. Use
-            // Awaitility with documented tolerance so a slow CI scheduler
-            // doesn't trip the test flake detector.
-            Awaitility.await()
-                    .atMost(Duration.ofSeconds(10))
-                    .pollInterval(Duration.ofMillis(250))
-                    .untilAsserted(() -> {
-                        verify(transactionalServiceMock, times(2))
-                                .processBatchTransactional(any(UUID.class));
-                    });
+            // Defensive: explicit latch-count assertion between the await
+            // and the Mockito verify. The boolean from
+            // attemptsFired.await(...) returning true only proves a single
+            // time-window saw count==0; an explicit count==0 assertion
+            // produces a clear "count was N, expected 0" failure message
+            // if Spring Retry ever silently short-circuits the retry
+            // boundary. Costs 1 line; buys a printed-locator failure.
+            assertThat(attemptsFired.getCount())
+                    .as("attemptsFired latch is fully drained once await returns true")
+                    .isZero();
 
-            assertThat(calls.get()).isEqualTo(2);
+            assertThat(calls.get())
+                    .as("processBatchTransactional called exactly twice (throw + succeed)")
+                    .isEqualTo(2);
+
             // No FAIL mark — the second attempt succeeded and the @Retryable
-            // boundary did not propagate, so the catch path in
-            // SettlementWorker.processBatchAsync did not fire. (It does NOT
-            // fire here because processBatchTransactional succeeded, so
-            // markBatchFailed is never called by the outer catch.)
+            // boundary did not propagate, so the @Recover path in
+            // SettlementWorker.processBatchAsync did NOT fire.
             verify(transactionalServiceMock, times(0))
                     .markBatchFailed(any(UUID.class), any());
         }

@@ -105,23 +105,26 @@ public class IdempotencyService {
 
     /**
      * Persist a response in a brand-new transaction independent of the
-     * controller's. Failure here is logged but never propagates — caches
-     * are best-effort. The {@code requestBody} bytes are hashed via
-     * SHA-256 and stored alongside the response — Phase 6 §12.6.1 item
-     * (5).
+     * controller's. The {@code requestBody} bytes are hashed via SHA-256
+     * and stored alongside the response — Phase 6 §12.6.1 item (5).
+     *
+     * <p><b>Phase 7.x fix (SRS §12.7.2):</b> the previous inner
+     * {@code try/catch(RuntimeException)} has been removed. Persistence
+     * failures now propagate out of this method so callers (notably
+     * {@link com.fintech.payment.idempotency.IdempotencyFilter}) see
+     * the actual exception and can decide how to handle it. The prior
+     * catch silently masked commit-time exceptions raised by Hibernate
+     * at flush-after-method, producing silent data-integrity drifts
+     * (HTTP 201 returned to client, no DB row actually persisted).</p>
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void save(String idempotencyKey, int responseStatus, String responseBody, byte[] requestBody) {
-        try {
-            String bodyHash = requestBody == null ? null : sha256Hex(requestBody);
-            repository.save(new IdempotencyRecord(
-                    idempotencyKey, responseStatus, responseBody, bodyHash, Instant.now()));
-            log.debug("Cached response under idempotencyKey={} status={} ({} bytes, hash={})",
-                    idempotencyKey, responseStatus,
-                    responseBody == null ? 0 : responseBody.length(), bodyHash);
-        } catch (RuntimeException ex) {
-            log.warn("Failed to persist idempotency cache for key={}: {}", idempotencyKey, ex.toString());
-        }
+        String bodyHash = requestBody == null ? null : sha256Hex(requestBody);
+        repository.save(new IdempotencyRecord(
+                idempotencyKey, responseStatus, responseBody, bodyHash, Instant.now()));
+        log.debug("Cached response under idempotencyKey={} status={} ({} bytes, hash={})",
+                idempotencyKey, responseStatus,
+                responseBody == null ? 0 : responseBody.length(), bodyHash);
     }
 
     /**

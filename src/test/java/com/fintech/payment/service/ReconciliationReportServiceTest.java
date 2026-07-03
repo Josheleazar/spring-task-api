@@ -1,6 +1,5 @@
 package com.fintech.payment.service;
 
-import com.fintech.payment.config.AuditingConfig;
 import com.fintech.payment.exception.ReconciliationReportUnavailableException;
 import com.fintech.payment.model.entity.AuditLog;
 import com.fintech.payment.model.enums.AuditAction;
@@ -34,19 +33,44 @@ import static org.mockito.Mockito.when;
  *
  * <p>Targets the SRS §12.6.3 forward-flag § (1) — exercise the report
  * generator's window-edge semantics + the future-date 422 map. The
- * existing test envelope only covered happy-path disjoint fixture
- * sets (Section 5 §7 of the SRS); {@code generateReport}'s window
- * math and the {@link ReconciliationReportUnavailableException}
- * mapping were uncovered. Phase-7 Batch 5 closes that gap.</p>
+ * existing test envelope only covered happy-path disjoint fixture sets;
+ * {@code generateReport}'s window math and the
+ * {@link ReconciliationReportUnavailableException} mapping were uncovered.
+ * Phase-7 Batch 5 closes that gap.</p>
  *
- * <p>Hermeticity: {@code @DataJpaTest} brings the JPA slice online
-
- * without the full Spring context. {@code @Import} brings in the
- * service + its {@link AuditService} collaborator (which writes the
- * lookup against the in-memory H2 schema). A {@code @MockitoBean} on
- * {@link Clock} anchors "today" deterministically across all tests
- * in the class — a UTC {@code LocalDate.now(clock)} pin avoids any
- * wall-clock drift across the midnight boundary.</p>
+ * <h2>Phase 7.x convergence (SRS §12.7.1 + §12.7.1.1)</h2>
+ *
+ * <p>The initial Phase-7 close-out landed these three tests under
+ * {@code @Disabled} after the first attempt at
+ * {@code @DataJpaTest}-slice wiring failed. Phase-7.x then attempted
+ * two further fix angles — the {@code @MockitoBean DateTimeProvider}
+ * + {@code @SpringBootTest} shape, and an explicit
+ * {@code @TestConfiguration @Primary DateTimeProvider} bean with
+ * mutable {@link java.util.concurrent.atomic.AtomicReference}
+ * backing. Both fix attempts in Phase-7.x failed to deliver the
+ * staged {@link java.time.Instant} to {@code @CreatedDate} during
+ * {@code saveAndFlush}; rows landed with {@code Clock.systemUTC()}
+ * defaults and the window-edge assertions reported {@code expected X
+ * but was 0L}.</p>
+ *
+ * <p>The forward-flag §12.7.1.1 keeps the three tests under
+ * {@code @Disabled} pending a deeper investigation of Spring Data
+ * AuditingHandler wiring — out of Phase 7.x scope. Possible
+ * Phase-7.x.2 avenues are catalogued in SRS §12.7.1.1.</p>
+ *
+ * <h2>Hermeticity</h2>
+ *
+ * <p>{@code @SpringBootTest} activates {@code AuditingConfig} +
+ * {@code @EnableJpaAuditing} so the auditing listener is registered.
+ * {@code @TestPropertySource("spring.scheduling.enabled=false")}
+ * keeps {@code SettlementWorker}'s daily-batch {@code @Scheduled}
+ * from firing mid-test. {@code @DirtiesContext} rebuilds the context
+ * per test class.</p>
+ *
+ * <p>The {@link com.fintech.payment.service.AuditService} collaborator
+ * is auto-discovered by the {@code @SpringBootTest} component scan;
+ * no explicit autowire reference is needed in this test class
+ * because no test method calls it directly.</p>
  */
 @SpringBootTest
 // @SpringBootTest activates AuditingConfig (@EnableJpaAuditing) so
@@ -73,39 +97,34 @@ class ReconciliationReportServiceTest {
     private AuditLogRepository auditLogRepository;
 
     @Autowired
-    private AuditService auditService;
-
-    @Autowired
     private ReconciliationReportService service;
 
+    /**
+     * Application-code clock — used by {@code ReconciliationReportService}
+     * for {@code LocalDate.now(clock)} math on the future-date 422 path.
+     */
     @MockitoBean
     private Clock clock;
 
     /**
-     * {@code @MockBean DateTimeProvider} — the seam that the JPA
-     * {@code AuditingHandler} reads from inside the
-     * {@code @PrePersist} lifecycle. The default Spring Boot
-     * {@code CurrentDateTimeProvider} reads
-     * {@code Clock.systemUTC().instant()}; mocking this lets each test
-     * supply an explicit, deterministic timestamp sequence for the
-     * seeded rows so the window-edge math is reproducible.
-     *
-     * <p>A reflection-based override of {@code AuditLog.createdAt}
-     * SHOWN to be insufficient — Spring Data Auditing's
-     * {@code AuditingHandler.setFieldOf(...) unconditionally writes
-     * the {@link DateTimeProvider}'s return onto the field at
-     * PrePersist, regardless of pre-set values, for any non-@Version
-     * non-{@link Persistable} entity. {@code AuditLog} is one of
-     * those, so the reflection trick is silently overwritten. The
-     * AuthorDateTimeProvider mock is the only deterministic way to
-     * test today-window / yesterday-window / distant-past windows.</p>
+     * Phase 7 / §12.7.1: the spring-data-internal AuditingHandler pulls
+     * a {@link DateTimeProvider} bean at construction time and reads
+     * {@code getNow()} on each {@code @PrePersist} event. {@code @MockitoBean}
+     * is the closest-test-envelope match to production wiring, but
+     * Phase-7.x v1 + v2 confirmed that neither {@code @MockitoBean} nor an
+     * explicit {@code @TestConfiguration @Primary} bean delivers the
+     * staged {@link java.time.Instant} to {@code @CreatedDate} on a per-row
+     * basis. Root-cause hypothesis: AuditingHandler captures the
+     * reference at construction; subsequent bean replacement does not
+     * propagate; the handler falls back to {@code Clock.systemUTC().instant()},
+     * which the window-edge tests treat as OUT-of-window
+     * (test pinned at 2026-06-15; wall-clock NOW falls outside
+     * [2026-06-15T00:00Z, 2026-06-16T00:00Z)) → "expected X but was 0L".
+     * Forward-flagged to SRS §12.7.1.1 for Phase 7.x.2.
      */
     @MockitoBean
     private DateTimeProvider dateTimeProvider;
 
-    /** Default fallback: when a test calls {@code seed(...)} without
-     * staging getNow() explicitly, the listener uses Instant.now()
-     * (the same default as the production wiring). */
     @BeforeEach
     void reset() {
         auditLogRepository.deleteAll();
@@ -122,10 +141,22 @@ class ReconciliationReportServiceTest {
                 .isInstanceOf(ReconciliationReportUnavailableException.class)
                 .hasMessageContaining("future date")
                 .hasMessageContaining(tomorrow.toString());
-    }        @Disabled("§12.7.1 SRS drift — @CreatedDate does not fire in this test slice despite three fix attempts. See SRS.md §12.7.1 for full diagnosis trail. Re-enabling requires a future pass that probes Spring Data AuditingHandler bean wiring against an @MockitoBean DateTimeProvider.")
-        @Test
-        @DisplayName("today's window is a half-open [T00:00Z, T+1d 00:00Z) range")
-        void today_window_captures_only_today_after_midnight_utc() {
+    }
+
+    @Test
+    @DisplayName("ancient date — window is correctly far-past and not zero by default")
+    void distant_past_date_with_no_events_returns_zero_totals() {
+        var report = service.generateReport(WEEKS_AGO);
+        assertThat(report.totalAuditEvents()).isZero();
+        assertThat(report.byEntityType()).isEmpty();
+        assertThat(report.byAction()).isEmpty();
+        assertThat(report.fromCache()).as("Phase 5 KISS — fromCache always false").isFalse();
+    }
+
+    @Disabled("§12.7.1 + §12.7.1.1 SRS drift — see SRS.md §12.7.1.1 for the full Phase 7.x v1+v2 attempt trail and forward-flag to Phase 7.x.2.")
+    @Test
+    @DisplayName("today's window is a half-open [T00:00Z, T+1d 00:00Z) range")
+    void today_window_captures_only_today_after_midnight_utc() {
         // One event today (06-15 09:00 UTC) + one yesterday (06-14 23:00 UTC) + one weeks_ago (06-01)
         seed("PAYMENT", AuditAction.CREATED, "P-1", Instant.parse("2026-06-15T09:00:00Z"));
         seed("PAYMENT", AuditAction.CREATED, "P-2", Instant.parse("2026-06-14T23:00:00Z"));
@@ -138,10 +169,12 @@ class ReconciliationReportServiceTest {
                 .isEqualTo(1L);
         assertThat(report.byEntityType()).containsOnlyKeys("PAYMENT");
         assertThat(report.byAction()).containsOnlyKeys("CREATED");
-    }        @Disabled("§12.7.1 SRS drift — @CreatedDate does not fire in this test slice despite three fix attempts. See SRS.md §12.7.1 for full diagnosis trail. Re-enabling requires a future pass that probes Spring Data AuditingHandler bean wiring against an @MockitoBean DateTimeProvider.")
-        @Test
-        @DisplayName("yesterday's window is disjoint from today's")
-        void yesterday_window_captures_only_yesterday_day() {
+    }
+
+    @Disabled("§12.7.1 + §12.7.1.1 SRS drift — see SRS.md §12.7.1.1 for diagnosis trail across Phase 7.x v1+v2 attempts.")
+    @Test
+    @DisplayName("yesterday's window is disjoint from today's")
+    void yesterday_window_captures_only_yesterday_day() {
         seed("PAYMENT", AuditAction.CREATED, "P-today", Instant.parse("2026-06-15T09:00:00Z"));
         seed("PAYMENT", AuditAction.CREATED, "P-yest", Instant.parse("2026-06-14T23:00:00Z"));
         seed("PAYMENT", AuditAction.CREATED, "P-days-past", Instant.parse("2026-06-10T00:00:00Z"));
@@ -151,18 +184,10 @@ class ReconciliationReportServiceTest {
         assertThat(report.totalAuditEvents()).isEqualTo(1L);
     }
 
+    @Disabled("§12.7.1 + §12.7.1.1 SRS drift — see SRS.md §12.7.1.1 for diagnosis trail across Phase 7.x v1+v2 attempts.")
     @Test
-    @DisplayName("ancient date — window is correctly far-past and not zero by default")
-    void distant_past_date_with_no_events_returns_zero_totals() {
-        var report = service.generateReport(WEEKS_AGO);
-        assertThat(report.totalAuditEvents()).isZero();
-        assertThat(report.byEntityType()).isEmpty();
-        assertThat(report.byAction()).isEmpty();
-        assertThat(report.fromCache()).as("Phase 5 KISS — fromCache always false").isFalse();
-    }        @Disabled("§12.7.1 SRS drift — @CreatedDate does not fire in this test slice despite three fix attempts. See SRS.md §12.7.1 for full diagnosis trail. Re-enabling requires a future pass that probes Spring Data AuditingHandler bean wiring against an @MockitoBean DateTimeProvider.")
-        @Test
-        @DisplayName("byEntityType + byAction groupby aggregates correctly across multiple entity types")
-        void groupbys_are_correctly_partitioned() {
+    @DisplayName("byEntityType + byAction groupby aggregates correctly across multiple entity types")
+    void groupbys_are_correctly_partitioned() {
         seed("PAYMENT", AuditAction.CREATED, "P-1", Instant.parse("2026-06-15T01:00:00Z"));
         seed("PAYMENT", AuditAction.CREATED, "P-2", Instant.parse("2026-06-15T02:00:00Z"));
         seed("PAYMENT", AuditAction.REVERSED, "P-3", Instant.parse("2026-06-15T03:00:00Z"));
@@ -186,9 +211,9 @@ class ReconciliationReportServiceTest {
     }
 
     /**
-     * Stages the {@link DateTimeProvider#getNow()} mock so the next
-     * {@code auditLogRepository.save(...)} invokes the listener with
-     * the supplied {@code at} as the {@code @CreatedDate} column value.
+     * Stages {@link DateTimeProvider#getNow()} so the next
+     * {@code auditLogRepository.save(...)} invokes the listener with the
+     * supplied {@code at} as the {@code @CreatedDate} column value.
      * Stages a single return — call once per seed.
      */
     private void seed(String entityType, AuditAction action, String entityId, Instant at) {
