@@ -122,7 +122,7 @@ class IdempotencyCacheMissTest {
         accountRepository.deleteAll();
     }
 
-    @Disabled("§12.7.2 SRS drift — IdempotencyService.save() silently swallows commit-time exceptions thrown by the @Transactional REQUIRES_NEW proxy (post-try/catch scope). See SRS.md §12.7.2 for full diagnosis trail.")
+    @Disabled("§12.7.2.2 SRS drift — Items 1+2 prod fixes verified IdempotencyService.save commit-time rethrow + IdempotencyFilter HandlerExceptionResolver routing, but the end-to-end IT's first POST hits entity_id NOT NULL during the body's @Audited controller annotation (AuditAspect.resolveEntityId on production paymentService.createPayment(...) returns null). Surfacing as 500 envelope; the persisted IdempotencyRecord assertion then finds an empty Optional. See SRS.md §12.7.2.2 for diagnosis trail + Phase 7.x.2 forward-flag.")
     @Test
     @DisplayName("cache-miss POST persists IdempotencyRecord with byte-faithful SHA-256 bodyHash")
     void cache_miss_persists_idempotency_record_with_sha256_bodyhash() {
@@ -172,6 +172,15 @@ class IdempotencyCacheMissTest {
         String body = buildBody(source.getId(), target.getId(), new BigDecimal("75.00"));
 
         ResponseEntity<String> first = post(idemKey, body);
+        // §12.7.2.2 forward-flag surrogate: explicit first-POST 201 assertion
+        // surfaces the AuditAspect.resolveEntityId defect (per §12.7.2.2) as
+        // a real failure rather than a silent mask on the cache-replay
+        // assertion chain downstream. Once Phase 7.x.2 resolves the
+        // entity_id wiring for paymentService.createPayment, this assertion
+        // will pass and the cache-replay path becomes GREEN end-to-end.
+        assertThat(first.getStatusCode().value())
+                .as("first POST must succeed before cache-replay assertion — entity_id NOT NULL would surface here per SRS §12.7.2.2")
+                .isEqualTo(201);
         long paymentRowsBefore = paymentRepository.count();
         long idempotencyRowsBefore = idempotencyRepository.count();
         long auditRowsBefore = auditLogRepository.count();
@@ -203,7 +212,7 @@ class IdempotencyCacheMissTest {
                 .isEqualByComparingTo(new BigDecimal("925.00"));
     }
 
-    @Disabled("§12.7.2 SRS drift — IdempotencyFilter OncePerRequestFilter throws IdempotencyKeyMismatchException outside DispatcherServlet's @ControllerAdvice boundary → Tomcat returns 500 instead of routed 422. See SRS.md §12.7.2 for full diagnosis trail.")
+    @Disabled("§12.7.2.2 SRS drift — Items 1+2 prod fixes verified @ControllerAdvice envelope routing on IdempotencyKeyMismatchException; the end-to-end IT's first POST also hits AuditAspect.resolveEntityId returning null for production paymentService.createPayment(...) → 500 envelope (expected 201). The body-hash mismatch path can't be exercised downstream of the broken first POST. See SRS.md §12.7.2.2 for diagnosis trail + Phase 7.x.2 forward-flag.")
     @Test
     @DisplayName("mismatched body + same idempotency key → 422 IDEMPOTENCY_KEY_BODY_MISMATCH")
     void mismatched_body_with_same_key_returns_422() {

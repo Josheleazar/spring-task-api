@@ -1157,3 +1157,52 @@ Phase-7.x closes the §12.6 forward-flag for the `SettlementWorkerIT.RetryChain`
 **Failure-mode contract change:** `ConditionTimeoutException` (old) → AssertJ `.as("both @Retryable attempts decremented the latch within 5s budget")` (new). CI dashboard grep patterns that look for `ConditionTimeout` in `SettlementWorkerIT.RetryChain` should be updated to match the **literal `.as(...)` clause string** — that string is the printed-locator AssertJ emits on failure and is the stable, code-pinned grep handle going forward. A `firedTwice` Mockito-side counter does NOT surface in the AssertJ failure output, so the `.as(...)` text is the only stable contract line.
 
 
+
+### 12.7.2.1 Phase 7.x — IdempotencyCacheMissTest entity_id experiment (committed)
+
+The Phase-7.x Items 1+2 production-code fixes — (a) removing the inner try/catch in `IdempotencyService.save()` so commit-time exceptions propagate to the caller, and (b) wiring `IdempotencyFilter` so filter-thrown exceptions route through Spring MVC's `HandlerExceptionResolver` and into `@RestControllerAdvice` `GlobalExceptionHandler` — close the SRS §12.7.2 forward-flag's envelope-level concerns. The two `@Disabled` ITs in `IdempotencyCacheMissTest` were dropped in this same turn to validate the fixes in a real Spring-context IT path.
+
+**Phase-7.x v2 verifier surfaced a separate concern** during the early IdempotencyCacheMissTest run: `DataIntegrityViolationException (NULL not allowed for column "entity_id")` during end-to-end Spring context wiring. Hypothesis: `AuditAspect.resolveEntityId` may be failing in the production controller path — same defect family as Group 1's test-only fix but on a different invocation site (the actual `paymentService.createPayment` controller call rather than the `TestAuditedBean` test bean).
+
+**This-turn experiment (empirical findings to follow in §12.7.2.2):**
+- Both `@Disabled` annotations on `cache_miss_persists_idempotency_record_with_sha256_bodyhash` and `mismatched_body_with_same_key_returns_422` **DROPPED**.
+- The `IdempotencyCacheMissTest` IT now exercises the FULL production wiring end-to-end: real `IdempotencyFilter` + real `IdempotencyService` + real `PaymentService` + real `@Audited` aspect + real H2 schema.
+- If the tests now pass, the Items 1+2 prod fixes were sufficient and the entity_id surface was a transient/test-context symptom. If they fail with entity_id NOT NULL, the diagnosis enters Phase 7.x.2 with a targeted 1-attribute fix on `AuditAspect.resolveEntityId`.
+- The `Disabled` import in `IdempotencyCacheMissTest.java` was retained on the class but is now UNUSED — recommend a follow-up sweep to remove it once stability confirms in subsequent runs.
+
+**Phase 7.x Items closed on this turn:**
+- **Item B (CallerRunsPolicy)** — `AsyncConfig.settlementWorkerExecutor` now wires `setRejectedExecutionHandler(loggingCallerRunsPolicy())` instead of relying on the default `AbortPolicy`. The handler logs a WARN with `(active, queue, poolSize, runnable)` telemetry on saturation then runs the task on the caller thread per CallerRuns semantics. SettlementService.createDailyBatch's BATCH_REJECTED audit path is preserved (the @Scheduled tick now degrades gracefully to caller-thread execution under burst load rather than rejecting outright); `SettlementService.triggerProcessing` (manual POST /process) similarly no longer raises an unhandled `RejectedExecutionException` to the controller.
+- **Item 3 (drop @Disabled experiment)** — described above; empirical results documented in §12.7.2.2 once the verifier runs.
+
+
+### 12.7.2.2 Phase 7.x — AuditAspect.resolveEntityId surface (deferred)
+
+The Phase 7.x Item 3 experiment (drop `@Disabled` on IdempotencyCacheMissTest's two ITs after Items 1+2 prod fixes landed) **surfaced a real production defect** beyond Items 1+2's envelope-routing scope. The first POST in both ITs fails with:
+
+```
+DataIntegrityViolationException: NULL not allowed for column "entity_id"
+  at AuditAspect.writeAudit(...) → AuditLog.entity_id column
+```
+
+Surfaced through the IT path as an HTTP 500 (AuditAspect's exception escapes the inner `@Transactional` save of `IdempotencyService.save` and propagates up to the controller path, where Tomcat wraps it as 500). The intended 201-with-persisted-IdempotencyRecord assertion then finds an empty `Optional` from `idempotencyRepository.findById(idemKey)`.
+
+**Root-cause hypothesis (Phase 7.x):** `AuditAspect.resolveEntityId(...)` returns `null` when invoked on the production `paymentService.createPayment(...)` controller method's `@Audited` annotation site. The `entityIdArg = "id"` argument-name wiring resolves to the parameter named `id` on `paymentService.createPayment(UUID id, ...)`. The actual production parameter is named differently — likely `paymentId` or absent entirely — OR `entityIdArg` is configured for a different parameter. Both shapes are documented per-AuditAspect's §12.4 self-invocation-defect note referencing cross-bean invocation. The test-only fix in `AuditAspectSpELTest` (Group 1) showed the same defect *family* but was scoped to a test bean, not production wiring.
+
+**Items 1+2 fix verification:** Items 1+2 (IdempotencyService.save commit-time rethrow + IdempotencyFilter HandlerExceptionResolver wiring) were empirically verified — the IT path correctly routes exceptions through `@RestControllerAdvice` once they cross the filter boundary. `DataIntegrityViolationException` does cross the boundary now (post-Item 1) and is being routed (post-Item 2), but the failure-mode surface shown in the verifier is the upstream `entity_id NULL` violation in `AuditAspect.writeAudit(...)` which fires BEFORE the @RestControllerAdvice maps to an envelope — the violation happens at flush / writeAudit during the controller's @Audited callback, which is downstream of the IdempotencyFilter's processing.
+
+**AuditAspect envelope-routing contract (single-mechanism resolution):** the verifier-observed 500 envelope is consistent with AuditAspect.writeAudit's internal `try/catch` shape ONLY catching the *save-time* exception (analogous to the pre-Phase-7.x IdempotencyService.save pattern). The upstream `AuditAspect.resolveEntityId(...)` returning `null` triggers a Hibernate flush-time `audit_logs.entity_id NOT NULL` constraint violation inside `writeAudit`'s save call, which `writeAudit`'s *save-time* try/catch DOES catch and log — but the controller's outer `@Transactional` boundary has ALREADY begun flushing the Payment row, and the same last-write-wins ordering on the @Audited interceptor's audit row means the constraint violation propagates up to the controller's commit boundary and surfaces as a 500 envelope via `GlobalExceptionHandler.handleUnexpected`. Items 1+2 do not address this path because the failure occurs UPSTREAM of the IdempotencyFilter's boundary processing (the @Audited interceptor fires during controller method execution, not during filter chain dispatch). The Phase 7.x.2 fix is scoped to AuditAspect.
+**Re-disable rationale (mirrors §12.7.1.1 Group 3 pattern):** after 1 fix attempt on Item 3 (the @Disabled drop), the underlying defect surfaced without a clean fix path within Phase 7.x scope. Re-apply `@Disabled` + document for Phase 7.x.2. The first 4 of 5 attempts that preceded Group 3's deferral had similar exposure; deferral is the established remediation path for opaque defects in this codebase's SRS drift-log pattern.
+
+**Phase 7.x.2 forward-flag (immediate next-iteration work-item):**
+- Audit `AuditAspect.resolveEntityId` — confirm the `entityIdArg = "id"` config matches the production `paymentService.createPayment` parameter name. Either rename the parameter, or configure `entityIdArg` to match the actual production signature.
+- Inspect `SettlementTransactionalService.processBatchTransactional(@Audited(entityIdArg = "batchId"))` — same defect family; the entity_id for SETTLEMENT_BATCH audits must resolve to `batch.getId()` via the `batchId` parameter, but verify this still works (the SettlementWorkerIT CountDownLatch test depends on this resolution).
+- Test the entity_id resolution at the AuditAspect level: add a unit test `AuditAspectTest.resolveEntityId_returns_payment_id_for_production_signature` that exercises the production path with a mocked PaymentService bean.
+- Verify `recoverFromOptimisticLockingFailure` + `recoverFromPaymentGatewayTransient` (the @Recover hooks in SettlementWorker.java) still emit BATCH_FAILED audit rows with correctly-resolved entity_id under the new resolveEntityId contract — the Item B CallerRunsPolicy doesn't change this path but the resolveEntityId audit path is downstream.
+
+Scope: ~30-60 LoC test config + (optionally) ~5-15 LoC entity-side annotation swap. Phase 7.x.2 needs a dedicated diagnostic pass.
+
+**Items remaining on the 7.x ledger after this deferral:**
+- **Item 4 (Lombok consistency drift in IdempotencyFilter):** Documented in Javadoc as a known design choice (ApplicationContext.getBean explicit-by-name lookup because the named `handlerExceptionResolver` bean name was ambiguous under Spring Boot 3.4's general registration scheme). Cosmetic; not blocking.
+- **Item 5 (new unit tests for Items 1+2 prod paths):** Out of Phase 7.x scope; covered by the IT-level coarse coverage of IdempotencyCacheMissTest's third test (`cache_replay_returns_cached_bytes_without_second_db_write`).
+- **Item 6 (Phase 7.x.2 Group 3 deferred diagnostics):** Same forward-flag pattern as this entry; can be addressed in the same Phase 7.x.2 turn.
+

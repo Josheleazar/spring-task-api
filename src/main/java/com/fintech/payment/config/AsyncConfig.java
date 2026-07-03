@@ -9,6 +9,7 @@ import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionHandler;
 
 /**
  * Phase 4 async configuration (SRS §11 + FR-3.3).
@@ -47,12 +48,56 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setMaxPoolSize(SETTLEMENT_WORKER_MAX_POOL_SIZE);
         executor.setQueueCapacity(SETTLEMENT_WORKER_QUEUE_CAPACITY);
         executor.setThreadNamePrefix(SETTLEMENT_WORKER_THREAD_NAME_PREFIX);
+        // Phase 7.x Item B — bounded backpressure. The previous default
+        // (ThreadPoolExecutor.AbortPolicy, inherited when setRejectedExecutionHandler
+        // was omitted) rejected outright on queue overflow (max queue depth =
+        // core + max-in-flight threads + queue capacity = 2 + 4 + 50 = 56 tasks).
+        // AbortPolicy raised RejectedExecutionException to the caller, which
+        // SettlementService.createDailyBatch() handled via a BATCH_REJECTED audit,
+        // but SettlementService.triggerProcessing() (manual POST /process) had
+        // no such catch — the rejection would propagate to the controller as
+        // a 500 INTERNAL_ERROR rather than degrading gracefully.
+        //
+        // CallerRunsPolicy degrades by running the task on the @Scheduled or
+        // @PostMapping caller thread when the pool + queue is saturated. At
+        // worst, the caller thread carries the work in-line rather than
+        // losing data outright. We wrap with a logging handler so we have
+        // an audit trail of saturation events without losing the
+        // graceful-degradation semantics.
+        executor.setRejectedExecutionHandler(loggingCallerRunsPolicy());
         executor.initialize();
-        log.info("Initialised settlementWorkerExecutor (core={}, max={}, queue={})",
+        log.info("Initialised settlementWorkerExecutor (core={}, max={}, queue={}, rejection=CallerRunsPolicy)",
                 SETTLEMENT_WORKER_CORE_POOL_SIZE,
                 SETTLEMENT_WORKER_MAX_POOL_SIZE,
                 SETTLEMENT_WORKER_QUEUE_CAPACITY);
         return executor;
+    }
+
+    /**
+     * Logging-wrapped {@link ThreadPoolExecutor.CallerRunsPolicy} —
+     * emits a WARN with task identity on saturation, then runs the
+     * rejected task on the caller thread (CallerRuns semantics). The
+     * default {@code ThreadPoolTaskExecutor} rejects via
+     * {@code AbortPolicy} → {@link java.util.concurrent.RejectedExecutionException},
+     * which forces upstream callers to either catch it explicitly (as
+     * {@code SettlementService.createDailyBatch} does for the daily tick)
+     * or surface it as a 500. With this wired-in graceful-degradation,
+     * the {@code @Scheduled} daily tick and the manual
+     * {@code POST /api/v1/settlements/{id}/process} trigger stay functional
+     * under burst load.
+     */
+    private static RejectedExecutionHandler loggingCallerRunsPolicy() {
+        return (runnable, executor) -> {
+            log.warn("settlementWorkerExecutor saturated (active={}, queue={}, poolSize={}) — " +
+                            "running rejected task {} on caller thread per CallerRunsPolicy",
+                    executor.getActiveCount(),
+                    executor.getQueue().size(),
+                    executor.getPoolSize(),
+                    runnable);
+            if (!executor.isShutdown()) {
+                runnable.run();
+            }
+        };
     }
 
     /**
