@@ -1088,3 +1088,39 @@ The Phase-6 cache-layer TOCTOU test covers the cache layer's own TOCTOU invarian
 - `AuditAspect.resolveSpelValue`'s `SpelExpressionParser` is constructed per-instance (per-AOP-proxy) and shared across all threads; it's thread-safe per the JDK spec. The `ConcurrentHashMap<SpelSlotKey, Expression>` cache is unbounded by design — the audit surface is finite. Phase 7 may add a max-size via caffeine if SpEL expressions proliferate.
 - The Phase-6 JaCoCo line-coverage floor of 0.60 is set on `com.fintech.payment.service.*` + `com.fintech.payment.audit.*` only. Other packages (`controller`, `repository`, `model`) are excluded from the gate. Phase 7 may broaden the include set after the targeted tests land.
 - `IdempotencyServiceTest` uses `@Transactional(propagation = NOT_SUPPORTED)` on the class - this is required to defeat Spring's @DataJpaTest snapshot-view interference with @Transactional(REQUIRES_NEW) save propagation in `IdempotencyService.save(...)`. Any future test class that needs REQUIRES_NEW semantics in the service layer should mirror this annotation.
+
+### 12.7.1 Phase 7 — ReconciliationReportServiceTest audit-deferral (committed)
+
+Phase-7 Batch-5 reconciliation coverage-push tests hit a refined-wiring blocker that defied 3 fix attempts. Per the user's Phase-7 prompt remediation option "accept the drift with SRS log entry", the 3 always-failing `ReconciliationReportServiceTest` cases are `@Disabled` with a forward-flag below. Group 1 (`AuditAspectSpELTest`, 6 cases) closed via a test-only fix on the same iteration (UUID `id` parameter added to `TestAuditedBean` methods; rationale documented inline at the test class).
+
+| Item | Spec | As-built | Reason |
+|------|------|----------|--------|
+| `today_window_captures_only_today_after_midnight_utc` | 3 seeded rows → 1 in today's half-open window | `0L` (silent `saveAndFlush` failure) | `@CreatedDate` on `AuditLog` did not fire → `audit_logs.created_at NOT NULL` constraint violation swallowed at test boundary |
+| `groupbys_are_correctly_partitioned` | 6 seeded rows → 6L `totalAuditEvents` | `0L` | same root cause |
+| `yesterday_window_captures_only_yesterday_day` | 3 seeded rows → 1L in yesterday's window | `0L` | same root cause |
+
+**Fix attempts (all unsuccessful - documented for future Phase-7.x workers):**
+
+1. `@DataJpaTest` + `@Import(AuditingConfig.class)`: verifier still reported 0 rows post-add. Hypothesis: `@DataJpaTest` slice silently swallows `@EnableJpaAuditing` post-processing, so `@CreatedDate` fires with `null` despite the `@Configuration` being on the bean factory path.
+2. `@DataJpaTest` → `@SpringBootTest` + 3-property `@TestPropertySource` scaffold (disable scheduler + async pool sized 0). **Compile failed** (`cannot find symbol: class TestPropertySource` - missing import).
+3. `@SpringBootTest` + 1-property `@TestPropertySource` + dropped redundant `@Import` line. Compile succeeded but tests still failed (`AssertionFailedError: expected X but was 0L`). `@CreatedDate` still did not fire on seeded rows.
+
+**Root-cause hypothesis (not proven - would require framework-debug instrumentation to verify):** Spring Data Auditing's `AuditingHandler` resolves its `DateTimeProvider` field at construction time (during `@EnableJpaAuditing` post-processing). If `@MockitoBean DateTimeProvider` registers its mock AFTER `AuditingHandler` has wired its (real) DateTimeProvider, the mock is not consulted and the handler falls through to `CurrentDateTimeProvider` reading `Clock.systemUTC().instant()`. The `@BeforeEach`-staged `dateTimeProvider.getNow()` return values are then ignored - `@CreatedDate` writes whatever the real `Clock` returns (or `null` depending on optional-handling), which does not match the `seed(...)`-captured inputs.
+
+**Deferral decision:** the user's Phase-7 prompt explicitly listed three remediation paths per failure (`revert`, `fix test`, `accept drift with SRS log entry`). Group 3 is closed via the third branch: `@Disabled` on the 3 always-failing tests + this SRS entry. The 2 non-disabled tests in the same class (`distant_past_date_with_no_events_returns_zero_totals`, `future_date_throws_reconciliation_unavailable`) remain GREEN, proving the test infrastructure works for what does not depend on `@CreatedDate` wiring.
+
+**Forward-flag (future Phase-7.x audit / hardening pass):** re-enable by registering an explicit `DateTimeProvider` bean in a `@TestConfiguration` (NOT via `@MockitoBean` proxy replacement). Replace `@MockitoBean DateTimeProvider` with `@Import(AuditingTestConfig.class)` providing a deterministic-bean `DateTimeProvider` whose `getNow()` returns the staged test instant via a setter. The existing `seed(...)` API would work unchanged once the proxy-replacement pattern is replaced with a deterministic-bean pattern - AuditingHandler picks the bean up at construction time so the timing-ordering pitfall is resolved.
+
+### 12.7.2 Phase 7 — IdempotencyCacheMissTest prod-bug deferral (committed)
+
+Phase-7 §12.6.1/§12.6.2 ITs surfaced two **pre-existing production defects** in the idempotency path. Per the Phase-7 prompt remediation option *"accept the drift with SRS log entry"* (same path used in §12.7.1), the 2 always-failing `IdempotencyCacheMissTest` ITs are `@Disabled` with the defect description preserved in the @Disabled messages — but unlike §12.7.1 (which was test-only), the underlying defect lives in **production code**. A future Phase-7.x hardening pass should resolve them in src/main, not in the test layer.
+
+| Item | Spec | As-built | Reason (defect lives in production code) |
+|------|------|----------|----------------------------------------|
+| `cache_miss_persists_idempotency_record_with_sha256_bodyhash` | Filter.cache miss → IdempotencyService.save() → row persisted with non-null bodyHash, byte-faithful SHA-256 | Assumed missing — assertion on persisted row fails post-201 | `IdempotencyService.save()` wraps its `@Transactional(REQUIRES_NEW)` proxy in a try/catch that swallows `RuntimeException`s raised at commit time (post try/catch scope). Net effect: HTTP returns 201 but no DB row actually lands. **Production defect:** clients believe their request succeeded but the record is missing — a silent data-integrity violation. Forward-flag: move the try/catch *inside* the @Transactional span (or remove it), and rethrow the original commit-time exception unmodified. |
+| `mismatched_body_with_same_key_returns_422` | Filter strict path → `IdempotencyKeyMismatchException` → GlobalExceptionHandler → 422 `IDEMPOTENCY_KEY_BODY_MISMATCH` | Tomcat returns 500 with stacktrace leak instead of routed 422 | `IdempotencyFilter extends OncePerRequestFilter` throws `IdempotencyKeyMismatchException` from a writeTo chain that runs *outside* the DispatcherServlet bean stack — `@RestControllerAdvice` GlobalExceptionHandler doesn't see it. **Production defect:** clients see a 500 + Apache Tomcat error page instead of the clean 422 envelope, leaking internals and breaking client contract. Forward-flag: catch and rethrow 422-mapped envelope inside filter chain, or wire a `HandlerExceptionResolver` into the filter path. |
+
+**Group 1 (AuditAspectSpELTest, 6 cases) closed via test-only fix on the same iteration — see §12.6.3 Phase 6 reference for the original spec.**
+
+**Forward-flag (Phase 7.x):** The two production-code defects above should be scheduled for a follow-up Phase-7.x sweep — they are NOT resolved by deferral; deferral only stops the test noise. Estimated scope: ~30-50 LoC across `IdempotencyService` (commit-time exception rethrow) and `IdempotencyFilter` (HandlerExceptionResolver injection or local envelope conversion). No new dependencies required.
+
