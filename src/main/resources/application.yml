@@ -34,3 +34,13 @@ logging:
     root: INFO
     com.fintech.payment: DEBUG
     org.hibernate.SQL: INFO
+
+# Actuator endpoints — exposed for demo smoke tests (e.g. `/actuator/health`).
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
