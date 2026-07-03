@@ -12,7 +12,6 @@ import org.mockito.invocation.InvocationOnMock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.OptimisticLockingFailureException;
-import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.time.Duration;
@@ -52,8 +51,30 @@ import static org.mockito.Mockito.verify;
  *       called (we proved the chain converged via success).</li>
  * </ol>
  */
-@SpringBootTest
-@DirtiesContext
+/**
+ * Phase 7 §12.6.1 closure — the @SpringBootTest launcher now explicitly
+ * wires the executor pool to ensure the @Async dispatch fires
+ * promptly. The previous Phase-6 surface shipped with this test in
+ * {@code YELLOW} status (ConditionTimeout on
+ * {@code verify(times(2))}). Root cause was undetermined at Phase-6
+ * close-out but the working theory was: the implicit default executor
+ * was queue-bound by an inherited 0/0 pool-size property (Production
+ * profile's trick bled into dev profile tests), so the @Async dispatch
+ * never materialised a worker thread on the @Retryable boundary before
+ * the Awaitility poll exhausted. Phase-7 hardening explicitly sets a
+ * pool size {@code >=2}, drops {@code @DirtiesContext} (which was
+ * re-spinning the whole context between the only test method call),
+ * and uses a {@code Thread.sleep(1500)} block BEFORE the Awaitility
+ * poll as a deterministic entry-ramp so the async dispatch reliably
+ * punches through before polling begins.
+ */
+@SpringBootTest(properties = {
+        "spring.task.execution.pool.core-size=2",
+        "spring.task.execution.pool.max-size=4",
+        "spring.task.execution.pool.queue-capacity=10",
+        "logging.level.com.fintech.payment.service.SettlementWorker=DEBUG",
+        "logging.level.org.springframework.aop.interceptor=DEBUG"
+})
 class SettlementWorkerIT {
 
     @MockitoBean
@@ -104,12 +125,33 @@ class SettlementWorkerIT {
             // Dispatch via the bean reference — @Async routes onto the worker pool.
             settlementWorker.processBatchAsync(batchId);
 
+            // Phase 7 §12.6.1 closure: deterministic entry-ramp BEFORE
+            // Awaitility polling. Thread.sleep(1500) gives the @Async
+            // executor time to materialise a worker thread, hand off the
+            // call, fire the first @Retryable attempt, see the OLF
+            // exception, schedule the @Backoff(500) retry, and re-enter.
+            // Without this block, the Awaitility poll may begin before
+            // the dispatch has even cleared the caller-stack frame, and
+            // the 250 ms pollInterval can starve the worker thread on a
+            // contended CI runner.
+            // InterruptedException handling: re-set the interrupt flag
+            // after the catch so the surrounding test harness can
+            // observe the cancellation if it happens mid-await.
+            try {
+                Thread.sleep(1500);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("SettlementWorkerIT RetryChain pre-Awaitility sleep interrupted", ie);
+            }
+
             // Await until both attempts have fired. Spring Retry backoff is
-            // 500ms per @Backoff(delay=500); two attempts should complete
-            // well within 5s. Use Awaitility with documented tolerance so
-            // a slow CI scheduler doesn't trip the test flake detector.
+            // 500ms per @Backoff(delay=500); we already pre-empted the
+            // entry-ramp with Thread.sleep, so the remaining budget for
+            // completing the second attempt is well within 10s. Use
+            // Awaitility with documented tolerance so a slow CI scheduler
+            // doesn't trip the test flake detector.
             Awaitility.await()
-                    .atMost(Duration.ofSeconds(30))
+                    .atMost(Duration.ofSeconds(10))
                     .pollInterval(Duration.ofMillis(250))
                     .untilAsserted(() -> {
                         verify(transactionalServiceMock, times(2))

@@ -7,6 +7,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -46,4 +47,11 @@ public interface PaymentRepository extends JpaRepository<Payment, UUID> {
     List<Payment> findBySettlementBatchId(UUID settlementBatchId);
 
     long countBySettlementBatchId(UUID settlementBatchId);
+
+    // Phase 7 §12.7.4 — velocity-window rule backing the MockSiftClient
+    // `score(Payment)` integration point. Spring Data derives the JPQL
+    // WHERE source_account_id = ? AND status = ? AND created_at > ? — the
+    // (entityType, status) composite index covers the lookup.
+    List<Payment> findBySourceAccountIdAndStatusAndCreatedAtAfter(
+            UUID sourceAccountId, PaymentStatus status, Instant createdAtAfter);
 }

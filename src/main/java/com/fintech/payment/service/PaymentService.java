@@ -165,12 +165,35 @@ public class PaymentService {
      * <p>Pre-condition: payment must exist and be {@code COMPLETED}. Any
      * other state (PENDING / FAILED / REVERSED) raises
      * {@link InvalidPaymentStateException}.</p>
+     *
+     * <h2>Phase 7 §12.7.1 — {@code @Audited} SpEL retrofit</h2>
+     *
+     * <p>The audit interceptor (Phase 6 §12.6.3) now records a JSON
+     * snapshot of the payment's lifecycle state in
+     * {@code audit_logs.old_value} / {@code audit_logs.new_value}:</p>
+     * <ul>
+     *   <li><strong>oldValueSpel = {@code "COMPLETED"}</strong> — literal
+     *       capturing the pre-state. The {@code oldValueSpel} SpEL
+     *       evaluator cannot reach the {@code Payment} entity loaded
+     *       inside the method body (it's a method-local, not a method
+     *       arg), so we use the literal '"COMPLETED"'. This is faithful
+     *       because the {@code InvalidPaymentStateException} guard above
+     *       ensures that any successful reverse really did start from
+     *       {@code COMPLETED} — so the snapshot is never a lie.</li>
+     *   <li><strong>newValueSpel = {@code #result.status.name()}</strong>
+     *       — captures the post-state by reaching into the
+     *       {@link PaymentResponse} DTO returned from the method
+     *       (Jackson serializes it pre-afterCommit while the Hibernate
+     *       session is still open).</li>
+     * </ul>
      */
     @Transactional
     @com.fintech.payment.audit.Audited(
             entityType = "PAYMENT",
             action = com.fintech.payment.model.enums.AuditAction.REVERSED,
-            entityIdArg = "id")
+            entityIdArg = "id",
+            oldValueSpel = "'COMPLETED'",
+            newValueSpel = "#result.status.name()")
     public PaymentResponse reversePayment(UUID id, String reason) {
         Payment payment = paymentRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Payment", id));
